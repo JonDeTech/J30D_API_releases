@@ -1,0 +1,67 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
+
+  "configurePresets": [
+    {
+      "name": "gcc",
+      "displayName": "gcc (Ninja)",
+      "description": "Host gcc build with the driver's full warning set as errors. Requires gcc and ninja on PATH.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/gcc",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "gcc",
+        "CMAKE_BUILD_TYPE": "Debug",
+        "J30D_WERROR": "ON"
+      }
+    },
+    {
+      "name": "gcc-make",
+      "inherits": "gcc",
+      "displayName": "gcc (MinGW Makefiles)",
+      "description": "Same as 'gcc' but without needing ninja -- uses w64devkit/MinGW's own mingw32-make.",
+      "generator": "MinGW Makefiles",
+      "binaryDir": "${sourceDir}/build/gcc-make"
+    },
+    {
+      "name": "gcc-nofloat",
+      "inherits": "gcc",
+      "displayName": "gcc, J30D_NO_FLOAT",
+      "description": "The FPU-less configuration. Different struct layouts, so worth building separately.",
+      "binaryDir": "${sourceDir}/build/gcc-nofloat",
+      "cacheVariables": { "J30D_NO_FLOAT": "ON" }
+    },
+    {
+      "name": "msvc",
+      "displayName": "MSVC (Visual Studio)",
+      "description": "CMake's default on Windows. Handy as a second compiler opinion; not a target platform.",
+      "generator": "Visual Studio 17 2022",
+      "binaryDir": "${sourceDir}/build/msvc"
+    }
+  ],
+
+  "buildPresets": [
+    { "name": "gcc",         "configurePreset": "gcc" },
+    { "name": "gcc-make",    "configurePreset": "gcc-make" },
+    { "name": "gcc-nofloat", "configurePreset": "gcc-nofloat" },
+    { "name": "msvc",        "configurePreset": "msvc" }
+  ],
+
+  "testPresets": [
+    {
+      "name": "gcc",
+      "configurePreset": "gcc",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "gcc-make",
+      "configurePreset": "gcc-make",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "gcc-nofloat",
+      "configurePreset": "gcc-nofloat",
+      "output": { "outputOnFailure": true }
+    }
+  ]
+}

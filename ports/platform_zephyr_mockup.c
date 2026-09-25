@@ -1,0 +1,169 @@
+/*
+ * platform_zephyr_mockup.c
+ *
+ * *** MOCKUP / SKETCH -- NOT COMPILED OR TESTED AGAINST REAL ZEPHYR ***
+ *
+ * This is here to show the *shape* a Zephyr port would take, using the
+ * idioms Zephyr expects (devicetree specs, k_mutex, k_msleep, the standard
+ * I2C API), so you have a starting point when you actually bring this up
+ * on a Zephyr target. Node names, the devicetree binding, and pin control
+ * states below are illustrative -- you'll need a real devicetree overlay
+ * for your board before any of this compiles.
+ *
+ * Expected devicetree shape (overlay, illustrative):
+ *
+ *   &i2c1 {
+ *       j30d0: j30d@7f {
+ *           compatible = "i2c-device";
+ *           reg = <0x7f>;
+ *       };
+ *   };
+ *
+ * Differences from the STM32 HAL ports worth calling out:
+ *
+ *   - return_to_iic: Zephyr's I2C API has a *standard* recovery hook,
+ *     i2c_recover_bus(), which the bus controller's own driver implements
+ *     if it supports it. Try that first. Not every controller driver
+ *     implements it though (silently returns -ENOSYS if not) -- the
+ *     fallback below manually toggles SCL via devicetree-defined GPIO
+ *     specs the same way the STM32 ports do, then re-applies the I2C
+ *     controller's default pinctrl state to hand the pins back. You will
+ *     need `scl-gpios` (and possibly `sda-gpios`) in your overlay for the
+ *     fallback path, plus a pinctrl default state for the I2C node to
+ *     restore.
+ *
+ *   - lock/unlock: k_mutex, not a counting semaphore -- fine here since
+ *     j30d.c never expects recursive locking from itself, only mutual
+ *     exclusion between callers.
+ *
+ *   - delay_ms: k_msleep() yields to the scheduler like FreeRTOS's
+ *     vTaskDelay(), same reasoning as the FreeRTOS port.
+ */
+
+#include "j30d_platform.h"
+
+#include <zephyr/kernel.h>
+#include <zephyr/drivers/i2c.h>
+#include <zephyr/drivers/gpio.h>
+#include <zephyr/device.h>
+
+#include <string.h>
+
+typedef struct
+{
+	const struct i2c_dt_spec  i2c;          /* from DEVICE_DT_GET + reg addr via devicetree */
+	const struct gpio_dt_spec scl_gpio;     /* fallback bus-recovery pin, if i2c_recover_bus() is unsupported */
+	struct k_mutex             mutex;
+} j30d_zep_ctx_t;
+
+/* Adjust the devicetree node label to match your overlay. */
+static j30d_zep_ctx_t j30d_zep_ctx_default = {
+	.i2c      = I2C_DT_SPEC_GET(DT_NODELABEL(j30d0)),
+	.scl_gpio = GPIO_DT_SPEC_GET_OR(DT_NODELABEL(j30d0), scl_gpios, {0}),
+};
+
+static j30d_err_t zep_i2c_read(void *ctx, uint8_t reg, uint8_t *buf, size_t len)
+{
+	j30d_zep_ctx_t *c = (j30d_zep_ctx_t *)ctx;
+	int rc = i2c_write_read_dt(&c->i2c, &reg, 1, buf, len);
+	if (rc == 0)       return J30D_OK;
+	if (rc == -ETIMEDOUT) return J30D_ERR_TIMEOUT;
+	return J30D_ERR_I2C;
+}
+
+static j30d_err_t zep_i2c_write(void *ctx, uint8_t reg, const uint8_t *buf, size_t len)
+{
+	j30d_zep_ctx_t *c = (j30d_zep_ctx_t *)ctx;
+	uint8_t tmp[1 + 16];   /* adjust if any single register write exceeds 16 bytes */
+
+	if (len + 1 > sizeof(tmp))
+	{
+		return J30D_ERR_PARAM;
+	}
+	tmp[0] = reg;
+	memcpy(&tmp[1], buf, len);
+
+	int rc = i2c_write_dt(&c->i2c, tmp, len + 1);
+	if (rc == 0)       return J30D_OK;
+	if (rc == -ETIMEDOUT) return J30D_ERR_TIMEOUT;
+	return J30D_ERR_I2C;
+}
+
+static void zep_delay_ms(void *ctx, uint32_t ms)
+{
+	(void)ctx;
+	k_msleep(ms);
+}
+
+static void zep_return_to_iic(void *ctx)
+{
+	j30d_zep_ctx_t *c = (j30d_zep_ctx_t *)ctx;
+
+	/* Preferred path: let the controller driver do it, if supported. */
+	int rc = i2c_recover_bus(c->i2c.bus);
+	if (rc == 0)
+	{
+		k_msleep(10);
+		return;
+	}
+
+	/* Fallback: manual SCL toggle via devicetree GPIO, mirroring the STM32
+	 * ports. Requires `scl-gpios` in your overlay and i2c_configure()
+	 * being safe to call again afterwards to reclaim the pins. */
+	if (c->scl_gpio.port != NULL)
+	{
+		gpio_pin_configure_dt(&c->scl_gpio, GPIO_OUTPUT_ACTIVE);
+		gpio_pin_set_dt(&c->scl_gpio, 0);
+		k_msleep(15);
+		gpio_pin_set_dt(&c->scl_gpio, 1);
+		k_msleep(5);
+	}
+
+	/* Re-apply the bus's default pinctrl state / re-init the controller so
+	 * it owns SCL/SDA again. i2c_configure() with the bus's existing
+	 * config is a reasonable proxy for "reinit" on most controller
+	 * drivers; swap for whatever your controller driver actually needs. */
+	uint32_t dev_config = 0;
+	if (i2c_get_config(c->i2c.bus, &dev_config) == 0)
+	{
+		i2c_configure(c->i2c.bus, dev_config);
+	}
+	k_msleep(10);
+}
+
+static bool zep_lock(void *ctx)
+{
+	j30d_zep_ctx_t *c = (j30d_zep_ctx_t *)ctx;
+	/* Non-zero means the lock was not taken (-EAGAIN on timeout); report
+	 * that rather than letting the caller through unserialized. */
+	return k_mutex_lock(&c->mutex, K_MSEC(500)) == 0;
+}
+
+static void zep_unlock(void *ctx)
+{
+	j30d_zep_ctx_t *c = (j30d_zep_ctx_t *)ctx;
+	k_mutex_unlock(&c->mutex);
+}
+
+/*
+ * Fills `platform` in ready to hand to j30d_init(). Call once at startup.
+ * As with the FreeRTOS port: if other devices share this bus, they need to
+ * cooperate with the same mutex for return_to_iic() to be safe -- Zephyr's
+ * own i2c_recover_bus() path is somewhat better protected here since it
+ * goes through the bus driver itself, but the manual GPIO fallback has the
+ * exact same "only cooperating callers are safe" caveat as the STM32
+ * ports.
+ */
+void j30d_platform_zephyr_init(j30d_platform_t *platform)
+{
+	k_mutex_init(&j30d_zep_ctx_default.mutex);
+
+	memset(platform, 0, sizeof(*platform));
+	platform->i2c_read      = zep_i2c_read;
+	platform->i2c_write     = zep_i2c_write;
+	platform->delay_ms      = zep_delay_ms;
+	platform->return_to_iic = zep_return_to_iic;
+	platform->lock          = zep_lock;
+	platform->unlock        = zep_unlock;
+	platform->ctx           = &j30d_zep_ctx_default;
+}

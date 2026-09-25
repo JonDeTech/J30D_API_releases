@@ -1,0 +1,74 @@
+J30D / JIRS30D SENSOR DRIVER LICENSE
+
+Copyright (c) 2026 JonDeTech Sensors AB. All rights reserved.
+
+This license applies to the J30D/JIRS30D sensor driver software, including
+its headers, source files, reference platform ports, and accompanying
+documentation (the "Software"), as made available by JonDeTech Sensors AB
+("JonDeTech") to customers and users of the J30D and JIRS30D heat-flux
+sensor product family (the "Product").
+
+1. GRANT OF LICENSE
+
+Subject to the conditions below, JonDeTech grants you a worldwide,
+royalty-free, non-exclusive, non-transferable license to use, reproduce,
+modify, and distribute the Software, in source or object code form, with
+or without modification, solely for the purpose of developing, testing,
+manufacturing, or operating equipment that interfaces with a genuine
+Product.
+
+2. CONDITIONS
+
+  a. Any redistribution of the Software, modified or unmodified, in
+     source or object code form, must reproduce this license text and
+     the copyright notice above.
+
+  b. This license does not grant any right to use the Software, in whole
+     or in part, to interface with, control, or communicate with any
+     sensor, device, or integrated circuit that is not a genuine Product
+     -- including a device marketed or intended as a drop-in replacement
+     or compatible alternative to the Product.
+
+  c. You may not use the name "JonDeTech", "JonDeTech Sensors AB", or the
+     names of its contributors to endorse or promote products derived
+     from the Software without prior written permission.
+
+  d. This license does not grant, by implication, estoppel, or
+     otherwise, any license or right under any patent, trademark, or
+     other intellectual property of JonDeTech except as expressly stated
+     above.
+
+3. NO WARRANTY
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT.
+IN NO EVENT SHALL JONDETECH OR ITS CONTRIBUTORS BE LIABLE FOR ANY CLAIM,
+DAMAGES, OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR
+OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR
+THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+THE SOFTWARE HAS NOT BEEN VALIDATED FOR USE IN SAFETY-CRITICAL,
+LIFE-SUPPORT, OR OTHER APPLICATIONS WHERE FAILURE OF THE SOFTWARE COULD
+LEAD TO PERSONAL INJURY, DEATH, OR SIGNIFICANT PROPERTY OR ENVIRONMENTAL
+DAMAGE. YOU ASSUME ALL RISK AND RESPONSIBILITY FOR ANY SUCH USE.
+
+4. NO SUPPORT OBLIGATION
+
+Nothing in this license obligates JonDeTech to provide support,
+maintenance, updates, bug fixes, or new versions of the Software.
+JonDeTech may change, deprecate, or discontinue the Software, or any
+part of it, at any time and without notice.
+
+5. TERMINATION
+
+This license terminates automatically, without notice, if you breach any
+of its conditions. Upon termination, you must cease all use,
+reproduction, and distribution of the Software, and destroy all copies
+in your possession or control, except as required to be retained by
+applicable law.
+
+6. GOVERNING LAW
+
+This license is governed by the laws of Sweden, without regard to its
+conflict-of-laws principles.
