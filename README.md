@@ -79,7 +79,6 @@ That is the whole hot path. `j30d_get_data()` refreshes all six fields in one ca
 | `config/j30d_config.c` | **Yours to edit.** The compiled-in `j30d_default_config`. |
 | `ports/` | Reference platform implementations — see the caveat below. |
 | `test/fake_sensor_test.c` | Host test suite. Runs anywhere, no hardware. |
-| `test/j30d_live_test.*` | On-target stress test. Needs real hardware and FreeRTOS. |
 | `CHANGELOG.md` | What changed in each release, and what to do about it. |
 
 **About `ports/`:** these `#include` *your* project's headers (`main.h`, `i2c.h`, the
@@ -305,12 +304,6 @@ the awkward parts of the hardware — sleep cutting off I²C mid-sequence, and t
 status registers clearing *all* their data-ready bits when read. `ctest` builds and
 runs it across the float / no-float and guarded / unguarded combinations, since those
 change struct layouts and refusal behaviour.
-
-`test/j30d_live_test.c` is a separate on-target stress test: it hammers config
-changes, sleep transitions and raw register access from several FreeRTOS tasks at
-once against a real sensor, then re-inits to prove recovery. It is not wired into any
-boot path — call `J30D_LiveTest_Run()` yourself. Read its header before extending it;
-it deliberately stays away from the registers listed under Safety guards.
 
 ## Licence
 
