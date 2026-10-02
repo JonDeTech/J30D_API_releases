@@ -2,10 +2,9 @@
  * platform_stm32_baremetal.c
  *
  * Reference j30d_platform_t implementation for STM32 (STM32Cube HAL),
- * no OS / single execution context. Modeled on this board's existing
- * i2c.c / jirs30d.c (I2C1 @ 100kHz, sensor on GPIOB6/7), but with the
- * FreeRTOS mutex and osDelay() calls stripped out -- there is nothing to
- * serialize against when only one context ever calls into the driver.
+ * no OS / single execution context. I2C1 @ 100kHz, sensor on GPIOB6/7,
+ * with no mutex and no RTOS delay -- there is nothing to serialize
+ * against when only one context ever calls into the driver.
  *
  * lock/unlock are left NULL in j30d_platform_stm32_baremetal_init() --
  * that's the correct choice here, not an oversight: see j30d_platform.h.
@@ -25,9 +24,18 @@
 
 #include <string.h>
 
-#define J30D_BM_I2C_ADDR      (0x7Fu << 1)   /* matches i2c_SA_JIRS30D in defines.h */
+#define J30D_BM_I2C_ADDR      (0x7Fu << 1)   /* wildcard address 0x7F, shifted for the HAL */
 #define J30D_BM_I2C_TIMEOUT   10u            /* ms, matches i2c_timeout in i2c.c */
 #define J30D_BM_I2C_RETRIES   3u
+
+/* SCL must be held low for more than 10ms to return the device to I2C idle;
+ * 15ms covers that plus per-platform delay rounding. The settle delay
+ * afterwards is 0, which compiles the call out -- HAL_Delay(0) still waits
+ * a tick. */
+#define J30D_BM_SCL_LOW_MS       15u
+/* 0 means no delay at all -- the call below is compiled out. Do not simply
+ * pass 0: vTaskDelay(0) is a yield, and HAL_Delay(0) still waits a tick. */
+#define J30D_BM_SETTLE_MS        0u
 
 #define J30D_BM_SCL_Pin        I2C_SCL_Pin
 #define J30D_BM_SCL_GPIO_Port  I2C_SCL_GPIO_Port
@@ -100,9 +108,9 @@ static uint32_t bm_now_ms(void *ctx)
 	return HAL_GetTick();   /* free-running SysTick millisecond counter -- wraps every ~49.7 days, j30d.c handles that */
 }
 
-/* Same GPIO bit-bang + HAL_I2C_Msp(De)Init sequence as the legacy
- * JIRS30D_I2CRelease()/JIRS30D_WakeDevice()/JIRS30D_Setup(), just relocated
- * out of the driver and behind this one hook. */
+/* The GPIO bit-bang and HAL_I2C_Msp(De)Init sequence that returns the bus
+ * to I2C idle, kept behind this one hook so the driver core carries no
+ * platform detail. */
 static void bm_return_to_iic(void *ctx)
 {
 	j30d_bm_ctx_t *c = (j30d_bm_ctx_t *)ctx;
@@ -126,12 +134,14 @@ static void bm_return_to_iic(void *ctx)
 	HAL_GPIO_Init(J30D_BM_SCL_GPIO_Port, &gpio_init);
 
 	HAL_GPIO_WritePin(J30D_BM_SCL_GPIO_Port, J30D_BM_SCL_Pin, GPIO_PIN_RESET);
-	HAL_Delay(15);
+	HAL_Delay(J30D_BM_SCL_LOW_MS);
 	HAL_GPIO_WritePin(J30D_BM_SCL_GPIO_Port, J30D_BM_SCL_Pin, GPIO_PIN_SET);
 
 	/* Hand the pins back to the I2C peripheral. */
 	HAL_I2C_MspInit(c->hi2c);
-	HAL_Delay(10);
+#if J30D_BM_SETTLE_MS > 0
+	HAL_Delay(J30D_BM_SETTLE_MS);
+#endif
 }
 
 /* One ctx instance per physical sensor/bus. Static storage is the usual

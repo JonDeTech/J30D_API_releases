@@ -1,8 +1,7 @@
 /*
  * j30d_config.c
  *
- * Definition of j30d_default_config. Values carried over unchanged from the
- * legacy jirs30d.c `sensor_config` initializer. Customer-editable -- these
+ * Definition of j30d_default_config. Customer-editable -- these
  * are the values applied whenever j30d_init() is passed a NULL config, or a
  * field is marked J30D_FIELD_DEFAULT. (A field marked J30D_FIELD_UNCHANGED
  * is left alone entirely and never reads this table.)
@@ -64,6 +63,10 @@ const j30d_config_t j30d_default_config = {
 		        | J30D_SYS_CHx_CFG_GAIN_64,
 		.status = J30D_FIELD_DEFAULT,
 	},
+
+	/* Off. Turning it on also requires platform.release_to_int, and makes the
+	 * I2C bus exclusive to this device -- see j30d_config.h. */
+	.interrupt_enable = false,
 
 	.bias_cfg = {
 		.value  = J30D_BIAS_CFG_5_16_AVDD,

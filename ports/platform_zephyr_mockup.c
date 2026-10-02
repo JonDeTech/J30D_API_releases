@@ -49,18 +49,22 @@
 
 #include <string.h>
 
+/* SCL must be held low for more than 10ms to return the device to I2C idle;
+ * 15ms covers that with margin. The settle delays are 0, which compiles the
+ * calls out -- k_msleep(0) would yield to the scheduler instead. */
+#define J30D_ZEP_SCL_LOW_MS      15u
+#define J30D_ZEP_SETTLE_MS       0u
+
+/* How long zep_lock() waits for the bus mutex. A timed-out take returns false
+ * and j30d.c turns that into J30D_ERR_TIMEOUT without touching the bus. */
+#define J30D_ZEP_MUTEX_WAIT_MS   500u
+
 typedef struct
 {
 	const struct i2c_dt_spec  i2c;          /* from DEVICE_DT_GET + reg addr via devicetree */
 	const struct gpio_dt_spec scl_gpio;     /* fallback bus-recovery pin, if i2c_recover_bus() is unsupported */
 	struct k_mutex             mutex;
 } j30d_zep_ctx_t;
-
-/* Adjust the devicetree node label to match your overlay. */
-static j30d_zep_ctx_t j30d_zep_ctx_default = {
-	.i2c      = I2C_DT_SPEC_GET(DT_NODELABEL(j30d0)),
-	.scl_gpio = GPIO_DT_SPEC_GET_OR(DT_NODELABEL(j30d0), scl_gpios, {0}),
-};
 
 static j30d_err_t zep_i2c_read(void *ctx, uint8_t reg, uint8_t *buf, size_t len)
 {
@@ -103,7 +107,9 @@ static void zep_return_to_iic(void *ctx)
 	int rc = i2c_recover_bus(c->i2c.bus);
 	if (rc == 0)
 	{
-		k_msleep(10);
+#if J30D_ZEP_SETTLE_MS > 0
+		k_msleep(J30D_ZEP_SETTLE_MS);
+#endif
 		return;
 	}
 
@@ -114,9 +120,11 @@ static void zep_return_to_iic(void *ctx)
 	{
 		gpio_pin_configure_dt(&c->scl_gpio, GPIO_OUTPUT_ACTIVE);
 		gpio_pin_set_dt(&c->scl_gpio, 0);
-		k_msleep(15);
+		k_msleep(J30D_ZEP_SCL_LOW_MS);
 		gpio_pin_set_dt(&c->scl_gpio, 1);
-		k_msleep(5);
+#if J30D_ZEP_SETTLE_MS > 0
+		k_msleep(J30D_ZEP_SETTLE_MS);
+#endif
 	}
 
 	/* Re-apply the bus's default pinctrl state / re-init the controller so
@@ -128,7 +136,9 @@ static void zep_return_to_iic(void *ctx)
 	{
 		i2c_configure(c->i2c.bus, dev_config);
 	}
-	k_msleep(10);
+#if J30D_ZEP_SETTLE_MS > 0
+	k_msleep(J30D_ZEP_SETTLE_MS);
+#endif
 }
 
 static bool zep_lock(void *ctx)
@@ -136,7 +146,7 @@ static bool zep_lock(void *ctx)
 	j30d_zep_ctx_t *c = (j30d_zep_ctx_t *)ctx;
 	/* Non-zero means the lock was not taken (-EAGAIN on timeout); report
 	 * that rather than letting the caller through unserialized. */
-	return k_mutex_lock(&c->mutex, K_MSEC(500)) == 0;
+	return k_mutex_lock(&c->mutex, K_MSEC(J30D_ZEP_MUTEX_WAIT_MS)) == 0;
 }
 
 static void zep_unlock(void *ctx)
@@ -144,6 +154,14 @@ static void zep_unlock(void *ctx)
 	j30d_zep_ctx_t *c = (j30d_zep_ctx_t *)ctx;
 	k_mutex_unlock(&c->mutex);
 }
+
+/* One ctx instance per physical sensor/bus. Adjust the devicetree node label
+ * to match your overlay, and swap for a caller-supplied instance if you need
+ * more than one. */
+static j30d_zep_ctx_t j30d_zep_ctx_default = {
+	.i2c      = I2C_DT_SPEC_GET(DT_NODELABEL(j30d0)),
+	.scl_gpio = GPIO_DT_SPEC_GET_OR(DT_NODELABEL(j30d0), scl_gpios, {0}),
+};
 
 /*
  * Fills `platform` in ready to hand to j30d_init(). Call once at startup.

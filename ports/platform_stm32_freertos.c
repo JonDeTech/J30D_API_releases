@@ -13,11 +13,7 @@
  * j30d_init()/j30d_update_config()/j30d_get_data() (which may issue several
  * i2c_read/i2c_write/return_to_iic calls each) -- not per HAL transaction.
  * If you add your own locking inside i2c_read/i2c_write on top of this,
- * with a non-recursive mutex, you will deadlock. This deliberately differs
- * from this project's existing i2c.c (which takes/gives i2c_mutex inside
- * every single I2C_ReadByte/WriteByte call) -- that pattern made sense when
- * every call site had to protect itself individually; here j30d.c is the
- * only caller of these hooks and it already brackets the whole operation.
+ * with a non-recursive mutex, you will deadlock.
  *
  * If other, non-J30D devices share this I2C bus, `mutex` below must be the
  * SAME mutex those drivers use to guard the bus -- not a private one
@@ -42,6 +38,24 @@
 #define J30D_FR_I2C_TIMEOUT   10u
 #define J30D_FR_I2C_RETRIES   3u
 #define J30D_FR_MUTEX_WAIT_MS 500u
+
+/* SCL must be held low for more than 10ms to return the device to I2C idle;
+ * 15ms covers that plus per-platform delay rounding. The settle delay
+ * afterwards is 0, which compiles the call out -- passing 0 to the delay
+ * function would yield to the scheduler instead. */
+#define J30D_FR_SCL_LOW_MS       15u
+/* 0 means no delay at all -- the call below is compiled out. Do not simply
+ * pass 0: vTaskDelay(0) is a yield, and HAL_Delay(0) still waits a tick. */
+#define J30D_FR_SETTLE_MS        0u
+
+/* Interrupt mode: SDA is the device's INT output while it sleeps. Pins 4-15
+ * map to EXTI4_15 on STM32L0; change this if SDA is on a lower pin. Your
+ * handler must clear the pending bit, call j30d_notify_interrupt(), and
+ * signal a task to do the read. See j30d_platform.h. */
+#define J30D_FR_INT_IRQn       EXTI4_15_IRQn
+/* M0+ has 2 priority bits, so 0-3, and no BASEPRI: any priority is safe for
+ * ...FromISR. On M3/M4/M7 this must be >= configMAX_SYSCALL_INTERRUPT_PRIORITY. */
+#define J30D_FR_INT_PRIO       3u
 
 #define J30D_FR_SCL_Pin        I2C_SCL_Pin
 #define J30D_FR_SCL_GPIO_Port  I2C_SCL_GPIO_Port
@@ -118,6 +132,10 @@ static void fr_return_to_iic(void *ctx)
 {
 	j30d_fr_ctx_t *c = (j30d_fr_ctx_t *)ctx;
 
+	/* Disarm before SDA returns to the I2C peripheral, or every byte on the
+	 * bus becomes an edge on this line. */
+	HAL_NVIC_DisableIRQ(J30D_FR_INT_IRQn);
+
 	HAL_GPIO_WritePin(J30D_FR_SDA_GPIO_Port, J30D_FR_SDA_Pin, GPIO_PIN_SET);
 	HAL_GPIO_WritePin(J30D_FR_SCL_GPIO_Port, J30D_FR_SCL_Pin, GPIO_PIN_SET);
 	HAL_I2C_MspDeInit(c->hi2c);
@@ -134,20 +152,19 @@ static void fr_return_to_iic(void *ctx)
 	HAL_GPIO_Init(J30D_FR_SCL_GPIO_Port, &gpio_init);
 
 	HAL_GPIO_WritePin(J30D_FR_SCL_GPIO_Port, J30D_FR_SCL_Pin, GPIO_PIN_RESET);
-	vTaskDelay(pdMS_TO_TICKS(15));
+	vTaskDelay(pdMS_TO_TICKS(J30D_FR_SCL_LOW_MS));
 	HAL_GPIO_WritePin(J30D_FR_SCL_GPIO_Port, J30D_FR_SCL_Pin, GPIO_PIN_SET);
 
 	HAL_I2C_MspInit(c->hi2c);
-	vTaskDelay(pdMS_TO_TICKS(10));
+#if J30D_FR_SETTLE_MS > 0
+	vTaskDelay(pdMS_TO_TICKS(J30D_FR_SETTLE_MS));
+#endif
 }
 
-/* Blocks up to J30D_FR_MUTEX_WAIT_MS, then reports whether the take actually
- * succeeded. A timed-out take returns false, and j30d.c turns that into
- * J30D_ERR_TIMEOUT without touching the bus -- the caller gets a failed
- * call instead of an unserialized one. Letting a timed-out caller through
- * (which this port used to do, because j30d_lock_fn returned void) silently
- * voided the mutual exclusion the mutex exists to provide, and then gave
- * back a semaphore this task never held. */
+/* Blocks up to J30D_FR_MUTEX_WAIT_MS and reports whether the take succeeded.
+ * A timed-out take must return false: j30d.c turns that into
+ * J30D_ERR_TIMEOUT without touching the bus. Returning true anyway voids the
+ * mutual exclusion and releases a semaphore this task never held. */
 static bool fr_lock(void *ctx)
 {
 	j30d_fr_ctx_t *c = (j30d_fr_ctx_t *)ctx;
@@ -170,6 +187,36 @@ static j30d_fr_ctx_t j30d_fr_ctx_default = { .hi2c = &hi2c1, .mutex = NULL };
  * physical bus, do not call this twice and use two different mutexes --
  * instead share one j30d_fr_ctx_t.mutex (and one hi2c) across all of them.
  */
+/* Hands SDA to the device as its INT output and arms the pin interrupt.
+ * Called only in interrupt mode. fr_return_to_iic() reclaims both pins. */
+static void fr_release_to_int(void *ctx)
+{
+	j30d_fr_ctx_t *c = (j30d_fr_ctx_t *)ctx;
+
+	HAL_GPIO_WritePin(J30D_FR_SDA_GPIO_Port, J30D_FR_SDA_Pin, GPIO_PIN_SET);
+	HAL_GPIO_WritePin(J30D_FR_SCL_GPIO_Port, J30D_FR_SCL_Pin, GPIO_PIN_SET);
+	HAL_I2C_MspDeInit(c->hi2c);
+
+	GPIO_InitTypeDef gpio_init = {0};
+	__HAL_RCC_GPIOB_CLK_ENABLE();
+
+	/* Falling edge: the device holds the line high and pulls it low. It
+	 * drives the line, so no pull resistor is needed. */
+	gpio_init.Pin  = J30D_FR_SDA_Pin;
+	gpio_init.Mode = GPIO_MODE_IT_FALLING;
+	gpio_init.Pull = GPIO_NOPULL;
+	HAL_GPIO_Init(J30D_FR_SDA_GPIO_Port, &gpio_init);
+
+	/* SCL stays ours: it is how the device is woken. */
+	gpio_init.Pin  = J30D_FR_SCL_Pin;
+	gpio_init.Mode = GPIO_MODE_OUTPUT_PP;
+	gpio_init.Pull = GPIO_NOPULL;
+	HAL_GPIO_Init(J30D_FR_SCL_GPIO_Port, &gpio_init);
+
+	HAL_NVIC_SetPriority(J30D_FR_INT_IRQn, J30D_FR_INT_PRIO, 0);
+	HAL_NVIC_EnableIRQ(J30D_FR_INT_IRQn);
+}
+
 void j30d_platform_stm32_freertos_init(j30d_platform_t *platform)
 {
 	if (j30d_fr_ctx_default.mutex == NULL)
@@ -185,5 +232,6 @@ void j30d_platform_stm32_freertos_init(j30d_platform_t *platform)
 	platform->lock          = fr_lock;
 	platform->unlock        = fr_unlock;
 	platform->now_ms        = fr_now_ms;
+	platform->release_to_int = fr_release_to_int;
 	platform->ctx           = &j30d_fr_ctx_default;
 }

@@ -5,8 +5,7 @@
  * expected to actually open and edit -- it has no I2C/platform detail in
  * it, just register-level settings and their default values.
  *
- * j30d_config_t is deliberately the same "per-field status" shape as the
- * legacy JIRS30D_Configuration_t: each field carries its own status so
+ * Every field in j30d_config_t carries its own status, so
  * j30d_update_config() only writes what actually changed, instead of
  * re-writing the whole register set on every call.
  */
@@ -15,6 +14,7 @@
 #define J30D_CONFIG_H_
 
 #include <stdint.h>
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -40,32 +40,15 @@ typedef struct
 typedef struct
 {
 	/* RAM - CHIP_ADDRESS (0x92): the device's own 7-bit I2C address.
+	 * Changes the address immediately, with no EEPROM programming or reset,
+	 * so it is applied at every j30d_init() like any other field.
 	 *
-	 * Writing it moves the device immediately -- no EEPROM programming and
-	 * no reset. That is measured, not assumed: see
-	 * J30D_LiveTest_AddressProbe(), which watches the new address start
-	 * answering and the old one fall silent. It behaves differently from
-	 * SYS_CFG1's output_mode, which IS latched at EEPROM load and does
-	 * nothing until programmed.
+	 * Your port must target the 0x7F wildcard, which every unit answers
+	 * whatever its address -- a port aimed at a fixed address would lose the
+	 * device the moment this is written.
 	 *
-	 * So this is an ordinary runtime setting, applied at every init like
-	 * every other field here, and nothing is ever stored. The driver never
-	 * programs EEPROM -- there is no code path that can, which is the point:
-	 * an interrupted EEPROM write destroys the factory calibration, and the
-	 * only airtight protection is not having the capability at all.
-	 *
-	 * IMPORTANT -- your port must target the 0x7F wildcard. The part always
-	 * answers 0x7F whatever its Chip_Address, so the driver keeps working
-	 * across the move; a port aimed at a specific address would lose the
-	 * device the moment this is written. 0x7F is also where an unprogrammed
-	 * unit answers, so it is the right thing for a port to use regardless.
-	 *
-	 * Only bits 6:0 are used. Note 0x00 is the I2C general call address --
-	 * a unit left there ACKs everyone's general call, which is usually a
-	 * good reason to set this to something else.
-	 *
-	 * Left J30D_FIELD_UNCHANGED in j30d_default_config, so a plain
-	 * j30d_init() never touches the address. */
+	 * Bits 6:0 only. 0x00 is the I2C general call address, so a unit left
+	 * there acknowledges every general call. UNCHANGED by default. */
 	j30d_config_field_t chip_address;
 
 	j30d_config_field_t command;   /* RAM    - COMMAND: mode select, mode enable, sleep enable (J30D_COMMAND_SLEEP_EN --
@@ -78,6 +61,21 @@ typedef struct
 	j30d_config_field_t ch1_cfg;   /* EEPROM - SYS_CH1_CFG: OSR, gain */
 	j30d_config_field_t ch2_cfg;   /* EEPROM - SYS_CH2_CFG: OSR, gain */
 	j30d_config_field_t bias_cfg;  /* EEPROM - BIAS_CFG */
+
+	/* Not a register shadow -- a driver mode, hence a plain bool.
+	 *
+	 * Uses the sleep-mode INT line to signal a new sample. The device has no
+	 * data-ready interrupt, so the driver sets the sleep threshold to its
+	 * minimum, which makes every sample raise INT. Your EXTI handler calls
+	 * j30d_notify_interrupt() and signals a task; that task calls
+	 * j30d_get_data(), never the handler.
+	 *
+	 * Requires platform.release_to_int; j30d_init() returns J30D_ERR_PARAM
+	 * without it.
+	 *
+	 * MAKES THE I2C BUS EXCLUSIVE TO THE J30D -- while the device sleeps,
+	 * SDA is not an I2C pin. Do not use on a shared bus. */
+	bool interrupt_enable;
 } j30d_config_t;
 
 /* Compiled-in defaults (values -- edit these for your product), applied by

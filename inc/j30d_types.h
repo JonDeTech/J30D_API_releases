@@ -65,9 +65,8 @@ typedef struct
 	j30d_field_state_t  state;
 } j30d_field_t;
 
-/* j30d_get_data() always refreshes every field below in one call -- there
- * used to be a J30D_SELECT_* bitmask here to fetch only some of them, but
- * that was removed: the device's DATA_READY/DATA_READY_RAW status
+/* j30d_get_data() always refreshes every field below in one call.
+ * The device's DATA_READY/DATA_READY_RAW status
  * registers clear ALL of their bits on being read, not just the bits for
  * whatever you go on to actually fetch, so partial selection could
  * silently starve a field you weren't asking for this call. See
@@ -110,6 +109,10 @@ typedef struct
 #define J30D_AMB_SCALE       16384.0f    /* 2^14 */
 #define J30D_VTP_SCALE       524288.0f   /* 2^19 */
 #define J30D_RAW_ADC_SCALE   8388608.0f  /* 2^23 */
+
+/* The ADC's reference, in volts. Pairs with J30D_RAW_ADC_SCALE above to turn
+ * a raw code into millivolts: mV = 1000 * code * VREF / (gain * SCALE). */
+#define J30D_ADC_VREF        1.1f
 #endif
 
 #ifdef __cplusplus

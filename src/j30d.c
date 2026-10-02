@@ -1,54 +1,22 @@
 /*
  * j30d.c
  *
- * Core driver implementation: j30d_init(), j30d_update_config(),
- * j30d_get_data(). No OS/HAL/GPIO calls anywhere in this file -- every
- * side effect goes through the j30d_platform_t hooks in the handle.
+ * Core driver implementation. No OS, HAL or GPIO calls anywhere in this
+ * file: every side effect goes through the j30d_platform_t hooks.
  *
- * Scope note: this file intentionally does NOT port
- * JIRS30D_CalibrateOffset/CalibrateGain (one-shot factory operations, never
- * verified working in the legacy driver either) or the heat-flux (k/m)
- * conversion in legacy JIRS30D_Convert() -- that's product-specific
- * application math layered on top of the raw calibrated values, and lives
- * in new_evk_sw's own j30d_adapter.c instead, not in this portable driver.
- * Reading the factory calibration/production data block itself IS ported
- * here (j30d_read_calibration(), populating h->calib) -- see j30d_calib.h
- * -- since that's just a register read the driver needs to do anyway, not
- * application logic.
+ * The driver does not select an active channel. Both ch1 and ch2 are
+ * exposed, each marked fresh only when its own data-ready bit is set, so in
+ * single-conversion mode ch2 simply stays stale.
  *
- * Design deviations from the legacy jirs30d.c worth knowing about:
- *
- *   - No "active channel" selection. The legacy driver picks one of
- *     ch1/ch2 at init (from calibration/unit version) and only reports
- *     that one. Since j30d_data_t already has separate ch1/ch2 (and
- *     raw_ch1/raw_ch2) fields, this driver just always reports both --
- *     whichever one is physically wired on a given product, the
- *     customer's application already knows and simply reads that field.
- *     Simpler, and removes a class of "wrong channel selected" bugs.
- *
- *   - raw_amb is NOT converted to millivolts, deliberately. The legacy
- *     RescaleRaw_mV() reused whatever channel's PGA gain (settings_gain)
- *     happened to be cached last for ch1, ch2 *and* amb, and an earlier
- *     revision of this driver carried that forward as a fixed unity gain.
- *     Both are wrong for the same reason: the ambient/internal temperature
- *     sensor does not go through the analog front end at all, so there is
- *     no PGA gain and no AFE reference in its path -- which is also why
- *     the register map has no gain register for it. A millivolt number for
- *     raw_amb does not correspond to anything physical, so none is
- *     produced: raw_amb.value carries the unscaled ADC code and raw_amb is
- *     there to expose exactly that. raw_ch1/raw_ch2 DO run through the
- *     PGA, so their mV conversion is real and is unchanged.
- *
- *   - No struct-over-bytes union tricks (the legacy DataReg24Bit/union
- *     overlays). Multi-byte reads are parsed byte-by-byte with explicit
- *     shifts instead -- overlaying a struct on a byte buffer depends on
- *     compiler packing/alignment/endianness, which isn't something a
- *     driver meant to be portable across arbitrary customer toolchains
- *     should rely on.
+ * Heat-flux conversion from the calibrated values is application math and
+ * lives in the integrator's code, not here. Reading the factory calibration
+ * block is done here, since it is a register read the driver needs anyway --
+ * see j30d_calib.h.
  */
 
 #include "j30d.h"
 #include "j30d_regs.h"
+#include "j30d_util.h"
 
 #include <string.h>
 #include <stdbool.h>
@@ -73,107 +41,12 @@
 #error "J30D_EEPROM_POLL_ATTEMPTS must be at least 1"
 #endif
 
-/* J30D_AMB_SCALE / J30D_VTP_SCALE / J30D_RAW_ADC_SCALE are now public,
- * declared in j30d_types.h (raw_code/value round-tripping needs them
- * outside this file too). */
-#if !defined(J30D_NO_FLOAT)
-#define J30D_ADC_VREF        1.1f
-#endif
-
-/* ---- small local helpers -------------------------------------------- */
-
-static int32_t sign_extend24(const uint8_t *b /* 3 bytes, MSB first */)
-{
-	uint32_t v = ((uint32_t)b[0] << 16) | ((uint32_t)b[1] << 8) | (uint32_t)b[2];
-	if (v & 0x800000u)
-	{
-		v |= 0xFF000000u;
-	}
-	return (int32_t)v;
-}
-
-#if !defined(J30D_NO_FLOAT)
-static float decode_gain(uint8_t cfg_reg_value)
-{
-	static const float gain_table[8] = { 8.0f, 12.0f, 16.0f, 32.0f, 48.0f, 64.0f, 96.0f, 128.0f };
-	uint8_t idx = (cfg_reg_value & J30D_SYS_CHx_CFG_GAIN_Msk) >> J30D_SYS_CHx_CFG_GAIN_Pos;
-	return gain_table[idx & 0x7u];
-}
-
-static float raw_to_mv(int32_t raw, float gain)
-{
-	return 1000.0f * ((float)raw * J30D_ADC_VREF) / (gain * J30D_RAW_ADC_SCALE);
-}
-#endif /* !J30D_NO_FLOAT */
-
 /* ---- calibration block parsing ----------------------------------------
- * Ported bit-for-bit from the legacy driver's crc16()/detect_unit_version()
- * /ReadProductionData() (see j30d_calib.h). Kept as free functions (not
- * static-local to j30d_init) so they're easy to unit-test in isolation
- * against known-good byte sequences from the legacy implementation.
+ * The block layout and its CRC are fixed by what the factory programmed
+ * into the part, so none of it is ours to choose -- see j30d_calib.h.
+ * Kept as free functions rather than static-local to j30d_init(), so they
+ * can be unit-tested in isolation against known-good byte sequences.
  */
-
-#define J30D_CRC16_POLY   0x8408u   /* reflected CCITT poly, matches legacy verbatim */
-
-static uint16_t j30d_crc16(const uint8_t *data, uint16_t length)
-{
-	uint32_t crc = 0xFFFFu;
-
-	if (length == 0)
-	{
-		return (uint16_t)(~crc);
-	}
-
-	while (length--)
-	{
-		uint32_t byte = *data++;
-		for (uint8_t i = 0; i < 8; i++, byte >>= 1)
-		{
-			if ((crc & 0x0001u) ^ (byte & 0x0001u))
-			{
-				crc = (crc >> 1) ^ J30D_CRC16_POLY;
-			}
-			else
-			{
-				crc >>= 1;
-			}
-		}
-	}
-
-	crc = (~crc) & 0xFFFFu;
-	uint32_t swapped = ((crc << 8) | ((crc >> 8) & 0xFFu)) & 0xFFFFu;
-	return (uint16_t)swapped;
-}
-
-/* The raw 16-bit trim word, before any Q-format interpretation. */
-static uint16_t j30d_trim_word(uint8_t msb, uint8_t lsb)
-{
-	return (uint16_t)(((uint16_t)msb << 8) | (uint16_t)lsb);
-}
-
-#if !defined(J30D_NO_FLOAT)
-/* U8Q8: 8-bit unsigned integer part + 8-bit fraction (range 0..255.996). */
-static float j30d_u8q8_to_float(uint8_t msb, uint8_t lsb)
-{
-	return (float)j30d_trim_word(msb, lsb) / 256.0f;
-}
-
-/* S7Q8: sign bit + 7-bit integer part + 8-bit fraction (range -128..127.996). */
-static float j30d_s7q8_to_float(uint8_t msb, uint8_t lsb)
-{
-	return (float)(int16_t)j30d_trim_word(msb, lsb) / 256.0f;
-}
-#endif /* !J30D_NO_FLOAT */
-
-static uint32_t j30d_be32(const uint8_t *p)
-{
-	return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | (uint32_t)p[3];
-}
-
-static uint16_t j30d_be16(const uint8_t *p)
-{
-	return (uint16_t)(((uint16_t)p[0] << 8) | (uint16_t)p[1]);
-}
 
 static j30d_unit_version_t j30d_detect_unit_version(const uint8_t *data)
 {
@@ -245,7 +118,7 @@ static void j30d_read_calibration(j30d_handle_t *h)
 
 	c->version = j30d_detect_unit_version(data);
 
-	/* Same Q8.8-vs-S7Q8 split the legacy driver used: rev>=2 units (the
+	/* Q8.8 or S7Q8 depending on the unit revision: rev>=2 units (the
 	 * only ones with a verified CRC) store signed trim values; everything
 	 * else predates that and used the unsigned format. CH2/UNKNOWN carry no
 	 * trustworthy trim data and stay at the memset-zero below. */
@@ -284,32 +157,21 @@ static void j30d_read_calibration(j30d_handle_t *h)
 }
 
 /* ---- destructive-write guards ------------------------------------------
- * Three registers can put a unit into a state this driver cannot talk it
- * out of. All three are refused with J30D_ERR_PARAM by default, on every
- * path that writes (j30d_init, j30d_update_config, j30d_raw_write), and
- * each has its own compile-time opt-out for the rare deliberate case.
+ * Three registers can leave a unit in a state this driver cannot recover.
+ * All are refused with J30D_ERR_PARAM on every write path, each with its
+ * own compile-time opt-out.
  *
- *   SYS_CFG1 (0x93) OUT_MODE -- selects I2C / PWM / Relay. Setting it to
- *     anything but I2C multiplexes SDA into a push-pull output and the IIC
- *     interface stops working. The real problem is that SYS_CFG1 is
- *     EEPROM-backed, so it survives power cycles and soft resets: the unit
- *     comes back up in PWM/Relay mode every time, and return_to_iic()
- *     buys only a momentary window rather than a fix. In practice this has
- *     bricked units on the bench. Note the guard is one-directional -- it
- *     rejects moving OFF I2C but always permits writing OUT_MODE back TO
- *     I2C, so recovering a unit that is already in this state still works.
- *     Every other bit of SYS_CFG1 (OSR, filter) is unaffected.
+ *   SYS_CFG1 (0x93) OUT_MODE -- anything but I2C turns SDA into a push-pull
+ *     output and stops the I2C interface. It is EEPROM-backed, so the unit
+ *     comes back that way after a reset. The guard is one-directional:
+ *     writing OUT_MODE back to I2C is always allowed, so a unit already in
+ *     that state can be recovered. Other SYS_CFG1 bits are unaffected.
  *
- *   BLOW_START (0x40) -- blows the EEPROM fuse. Irreversible, production
- *     tooling only.
+ *   BLOW_START (0x40) -- blows the EEPROM fuse. Irreversible.
  *
- *   CUSTOM_MEMORY (0xC0..0xEF) -- the factory calibration block. Writing
- *     it destroys this unit's calibration permanently; the driver only
- *     ever reads it (see j30d_calib.h).
- *
- * These are build-time escapes, not runtime flags, so enabling one is a
- * deliberate decision recorded in the build rather than something a stray
- * call can do. */
+ *   CUSTOM_MEMORY (0xC0..0xEF) -- the factory calibration block. The driver
+ *     only reads it; see j30d_calib.h.
+ */
 
 #if !defined(J30D_ALLOW_NON_I2C_OUTPUT)
 static bool sys_cfg1_selects_i2c(uint8_t value)
@@ -433,15 +295,43 @@ static j30d_err_t seed_shadow_from_device(j30d_handle_t *h)
 	return J30D_OK;
 }
 
-/* Order matters here and is NOT arbitrary -- ported from the legacy
- * driver's setup sequence (SysCfg1, SysCfg2, Ch1Cfg, Ch2Cfg, sleep,
- * BpsCfg, and only THEN the command/sleep-enable write, "lastly, start
- * the device"). COMMAND is what actually puts the device to sleep the
+/* Order matters here and is NOT arbitrary: SYS_CFG1, SYS_CFG2, CH1, CH2,
+ * SLEEP_TIME, BIAS_CFG, and only THEN the command/sleep-enable write.
+ * COMMAND is what actually puts the device to sleep the
  * moment SLEEP_EN lands on the bus -- write it any earlier than last and
  * every subsequent register write in this same call goes out to a
  * sleeping device and fails, since the device stops ACKing I2C until the
  * next return_to_iic() wake. So: everything else first, command last,
  * always. Do not reorder this without re-checking that constraint. */
+/* ---- interrupt mode ------------------------------------------------------
+ * The device has no data-ready interrupt, but its sleep-mode comparator
+ * raises INT after any conversion that meets the threshold. The most
+ * negative threshold the register can express (-128mV) is at or below the
+ * bottom of the range under either VT_SCALE setting, so every sample
+ * qualifies and INT means "new sample".
+ *
+ * Written at each init: the registers are EEPROM-backed and this driver
+ * does not program EEPROM. */
+static j30d_err_t apply_interrupt_mode(j30d_handle_t *h)
+{
+	/* Verified, not written: some SYS_CFG2 bits take effect only at EEPROM
+	 * load, so a write here would not reliably apply. */
+	uint8_t sys_cfg2 = 0;
+	j30d_err_t err = h->platform.i2c_read(h->platform.ctx, J30D_REG_SYS_CFG2, &sys_cfg2, 1);
+	if (err != J30D_OK)
+	{
+		return err;
+	}
+	if (sys_cfg2 & J30D_SYS_CFG2_SLEEP_POL_Msk)
+	{
+		/* "Trigger when lower" can never be met by the minimum threshold. */
+		return J30D_ERR_PARAM;
+	}
+
+	uint8_t threshold[2] = { J30D_INT_THRESHOLD_MSB, J30D_INT_THRESHOLD_LSB };
+	return h->platform.i2c_write(h->platform.ctx, J30D_REG_T_THRESHOLD_SLEEP_MSB, threshold, 2);
+}
+
 static j30d_err_t apply_config(j30d_handle_t *h, const j30d_config_t *cfg)
 {
 	j30d_err_t err;
@@ -458,6 +348,13 @@ static j30d_err_t apply_config(j30d_handle_t *h, const j30d_config_t *cfg)
 	if ((err = apply_field(h, J30D_REG_SYS_CH2_CFG, &h->config.ch2_cfg,  &cfg->ch2_cfg,  &j30d_default_config.ch2_cfg))  != J30D_OK) return err;
 	if ((err = apply_field(h, J30D_REG_SLEEP_TIME,  &h->config.sleep,    &cfg->sleep,    &j30d_default_config.sleep))    != J30D_OK) return err;
 	if ((err = apply_field(h, J30D_REG_BIAS_CFG,    &h->config.bias_cfg, &cfg->bias_cfg, &j30d_default_config.bias_cfg)) != J30D_OK) return err;
+	/* Before COMMAND: a sleeping device does not acknowledge I2C. */
+	h->config.interrupt_enable = cfg->interrupt_enable;
+	if (h->config.interrupt_enable)
+	{
+		if ((err = apply_interrupt_mode(h)) != J30D_OK) return err;
+	}
+
 	if ((err = apply_field(h, J30D_REG_COMMAND,     &h->config.command,  &cfg->command,  &j30d_default_config.command))  != J30D_OK) return err;
 
 	/* #4: every field now either matches the device (just written) or was
@@ -479,25 +376,17 @@ static j30d_err_t apply_config(j30d_handle_t *h, const j30d_config_t *cfg)
 }
 
 /* ---- sleep handling -----------------------------------------------------
- * Whether the device is configured to sleep is just the SLEEP_EN bit of
- * the shadow COMMAND value -- same convention the legacy driver used
- * (device_sleeping() there was exactly this bit test, not a separately
- * tracked runtime flag). Every call below that touches the bus wakes the
- * device first if sleep is configured, then re-commands sleep afterward --
- * the caller never has to know or care whether the device happens to be
- * asleep right now. This costs a full return_to_iic() (the GPIO wake
- * sequence, tens of ms) on every such call when sleep is enabled, even if
- * the device turns out to already be awake -- deliberately simple and
- * always-correct over trying to track actual runtime sleep state.
+ * Sleep is configured iff SLEEP_EN is set in the shadow COMMAND value;
+ * there is no separate runtime flag. Every call that touches the bus wakes
+ * the device first and re-commands sleep afterwards, so callers never have
+ * to know whether it is asleep. That costs a full return_to_iic() per call
+ * even when the device was already awake -- always correct, at the price of
+ * being occasionally wasteful.
  *
- * j30d_get_data() alone gets a second layer on top: if platform.now_ms is
- * provided, it also refuses to wake more often than the configured sleep
- * interval, since a sleeping device simply cannot have produced a new
- * sample any faster than that -- see should_skip_get_data_wake() below.
- * Without now_ms, j30d_get_data() falls back to the always-wake behavior
- * above (correct, just potentially wasteful if called faster than the
- * sleep interval). j30d_update_config()/j30d_raw_read()/j30d_raw_write()
- * are never paced this way -- they always do what you asked, immediately.
+ * j30d_get_data() adds one layer: given platform.now_ms, it will not wake
+ * more often than the sleep interval, since no new sample can exist sooner.
+ * A pending j30d_notify_interrupt() overrides that for one call. Nothing
+ * else is paced.
  */
 
 static bool sleep_is_configured(const j30d_handle_t *h)
@@ -505,11 +394,46 @@ static bool sleep_is_configured(const j30d_handle_t *h)
 	return (h->config.command.value & J30D_COMMAND_SLEEP_EN) != 0;
 }
 
-static void ensure_awake(j30d_handle_t *h)
+/* A wake clears SLEEP_EN but leaves MODE_EN set, so the device comes back
+ * converting and a burst read can straddle a conversion boundary. Stopping
+ * the engine first freezes the data registers, so preemption between the
+ * wake and the read no longer matters.
+ *
+ * SLEEP_EN must be cleared in the same write: the shadow still carries it,
+ * and writing it back would put the device straight back to sleep.
+ * restore_sleep_if_needed() re-arms both bits afterwards.
+ *
+ * Sleeping configurations only -- a continuously converting device is doing
+ * what the caller asked for. */
+static j30d_err_t halt_conversions(j30d_handle_t *h)
 {
-	if (sleep_is_configured(h))
+	uint8_t value = (uint8_t)(h->config.command.value &
+	                          ~(J30D_COMMAND_SLEEP_EN | J30D_COMMAND_MODE_EN));
+	return h->platform.i2c_write(h->platform.ctx, J30D_REG_COMMAND, &value, 1);
+}
+
+static j30d_err_t ensure_awake(j30d_handle_t *h)
+{
+	if (!sleep_is_configured(h))
 	{
-		h->platform.return_to_iic(h->platform.ctx);
+		return J30D_OK;
+	}
+
+	h->platform.return_to_iic(h->platform.ctx);
+	return halt_conversions(h);
+}
+
+/* Hand SDA to the device so it can drive INT. Only in interrupt mode, only
+ * with sleep configured, and only after the sleep command has been written
+ * -- releasing first would leave that write with no bus. Called from both
+ * places the device ends up asleep; idempotent. */
+static void release_bus_to_int(j30d_handle_t *h)
+{
+	if (h->config.interrupt_enable &&
+	    sleep_is_configured(h) &&
+	    h->platform.release_to_int != NULL)
+	{
+		h->platform.release_to_int(h->platform.ctx);
 	}
 }
 
@@ -525,12 +449,14 @@ static void restore_sleep_if_needed(j30d_handle_t *h)
 	{
 		uint8_t value = h->config.command.value;
 		(void)h->platform.i2c_write(h->platform.ctx, J30D_REG_COMMAND, &value, 1);
+
+		release_bus_to_int(h);
 	}
 }
 
 /* SLEEP_TIME register -> milliseconds: register value 0x00 == 100ms, then
- * +100ms per step (matches the legacy driver's convention, see the comment
- * on J30D_REG_SLEEP_TIME in j30d_regs.h). */
+ * +100ms per step -- see the comment on J30D_REG_SLEEP_TIME in
+ * j30d_regs.h. */
 static uint32_t sleep_interval_ms(const j30d_handle_t *h)
 {
 	return ((uint32_t)h->config.sleep.value + 1u) * 100u;
@@ -547,6 +473,29 @@ static uint32_t sleep_interval_ms(const j30d_handle_t *h)
  * write always do exactly what you asked (see their doc comment in
  * j30d.h) -- they're the escape hatch for when you specifically need to
  * talk to the device right now, sleep pacing or not. */
+/* How much time must pass before j30d_get_data() will wake the device again.
+ *
+ * Polling: the full sleep interval. The pacing is pure rate-limiting there --
+ * there is nothing new to read before the device has slept and converted.
+ *
+ * Interrupt mode: half of it, because the pacing has a second job. The device
+ * raises INT again a few ms after every sleep command (measured: ~9 ms after
+ * the last byte, whatever MODE_EN is doing), so an interrupt-driven read must
+ * reject that one and accept the one that ends a sleep interval. Pacing at the
+ * full interval cannot: SLEEP_TIME is untrimmed, +/-15% on a 32 kHz
+ * oscillator, so a fast part raises its genuine interrupt at ~0.87 of the
+ * nominal interval and the full-interval threshold would reject it as well --
+ * halving the sample rate on a part that is in spec.
+ *
+ * Half separates them at every SLEEP_TIME setting. The worst case is the
+ * shortest interval, 100 ms: 50 ms against an extra interrupt that arrives
+ * ~30 ms after the wake, and against a genuine one no earlier than ~115 ms. */
+static uint32_t pacing_interval_ms(const j30d_handle_t *h)
+{
+	uint32_t interval = sleep_interval_ms(h);
+	return h->config.interrupt_enable ? (interval / 2u) : interval;
+}
+
 static bool should_skip_get_data_wake(const j30d_handle_t *h)
 {
 	if (!sleep_is_configured(h) || !h->platform.now_ms || !h->internal.get_data_has_woken)
@@ -555,28 +504,22 @@ static bool should_skip_get_data_wake(const j30d_handle_t *h)
 	}
 	uint32_t now     = h->platform.now_ms(h->platform.ctx);
 	uint32_t elapsed = now - h->internal.last_get_data_wake_ms;   /* wraparound-safe: unsigned subtraction */
-	return elapsed < sleep_interval_ms(h);
+	return elapsed < pacing_interval_ms(h);
 }
 
 /* ---- raw-write shadow sync ---------------------------------------------
- * j30d_raw_write() bypasses the config model, but the driver still acts on
- * h->config: sleep_is_configured() and restore_sleep_if_needed() read
- * COMMAND out of it, sleep_interval_ms() reads SLEEP_TIME, and decode_gain()
- * reads the channel configs to scale raw_ch1/raw_ch2 into millivolts. A raw
- * write that lands on one of those registers therefore has to be reflected
- * in the shadow, or the driver goes on acting from a stale copy -- most
- * visibly by "restoring" sleep to the OLD command value immediately after
- * the caller wrote a new one, undoing the write on the way out of the same
- * call.
+ * j30d_raw_write() bypasses the config model, but the driver still reads
+ * h->config for COMMAND, SLEEP_TIME and the channel configs. A raw write to
+ * one of those must be reflected in the shadow, or the driver acts on a
+ * stale copy -- most visibly by restoring sleep to the old COMMAND value on
+ * the way out of the same call, undoing the write.
  *
- * Register addresses auto-increment across a burst, so a write of `len`
- * bytes starting at `reg` covers reg .. reg+len-1; any modelled register in
- * that span is updated from the corresponding byte.
+ * Addresses auto-increment, so a write of `len` bytes covers
+ * reg .. reg+len-1.
  *
- * Not covered, and deliberately so: a raw write to J30D_REG_SOFT_RESET.
- * That resets the device and reloads EEPROM behind the driver's back, which
- * invalidates the whole shadow (and the calibration read) in a way no
- * bookkeeping here can repair -- call j30d_init() again instead. */
+ * A raw write to SOFT_RESET is deliberately not covered: it reloads EEPROM
+ * behind the driver and invalidates the whole shadow. Call j30d_init()
+ * again instead. */
 static void sync_shadow_after_raw_write(j30d_handle_t *h, uint8_t reg, const uint8_t *buf, size_t len)
 {
 	const struct
@@ -659,6 +602,30 @@ j30d_err_t j30d_init(j30d_handle_t *h, const j30d_platform_t *platform, const j3
 		return J30D_ERR_PARAM;
 	}
 
+	/* Without the hook the device never gets its pin, so INT never fires.
+	 *
+	 * now_ms is required too, and for a subtler reason: commanding sleep
+	 * makes the device convert and raise INT again a few ms later, whatever
+	 * MODE_EN was doing -- measured on the bench, not assumed. Only the
+	 * pacing in should_skip_get_data_wake() rejects those, and that pacing
+	 * needs a clock. Without one, every extra interrupt would be answered
+	 * with a read that re-commands sleep and retriggers the same interrupt,
+	 * and the device would never complete a sleep interval.
+	 *
+	 * Sleep itself is required as well: INT is the sleep-mode comparator
+	 * output on SDA, so with SLEEP_EN clear the pin is never handed to the
+	 * device and no interrupt can ever fire. Accepting that combination
+	 * initialises cleanly and then signals nothing, forever. */
+	{
+		const j30d_config_t *want = (config != NULL) ? config : &j30d_default_config;
+		if (want->interrupt_enable &&
+		    (platform->release_to_int == NULL || platform->now_ms == NULL ||
+		     (want->command.value & J30D_COMMAND_SLEEP_EN) == 0))
+		{
+			return J30D_ERR_PARAM;
+		}
+	}
+
 	memset(h, 0, sizeof(*h));
 	h->platform = *platform;
 
@@ -708,28 +675,20 @@ j30d_err_t j30d_init(j30d_handle_t *h, const j30d_platform_t *platform, const j3
 	}
 
 	/* Best-effort: never fails init, see j30d_read_calibration(). Read
-	 * before apply_config() below, matching the legacy driver's order
-	 * (ReadProductionData() before the sleep/config write), though nothing
-	 * here currently depends on that ordering. */
+	 * before apply_config() below, though nothing here currently depends
+	 * on that ordering. */
 	j30d_read_calibration(h);
 
-	/* Seed the shadow with register addresses + compiled-in defaults, then
-	 * apply whatever the caller actually asked for (NULL == "just use
-	 * j30d_default_config wholesale").
+	/* Seed the shadow with the compiled-in defaults, then apply what the
+	 * caller asked for (NULL means use them wholesale).
 	 *
-	 * Fields left J30D_FIELD_UNCHANGED in a caller-supplied config are not
-	 * written -- the device keeps whatever the EEPROM held before this
-	 * reset -- so for those the shadow is seeded by reading the device back
-	 * first, otherwise h->config would claim the compiled-in default for a
-	 * register nobody wrote. (COMMAND/SLEEP_TIME can't reach here as
-	 * UNCHANGED; see the param check at the top of this function.)
+	 * Fields left J30D_FIELD_UNCHANGED are not written, so their shadow is
+	 * seeded by reading the device back instead -- otherwise h->config would
+	 * claim a default for a register nobody wrote.
 	 *
-	 * Every field's status ends up J30D_FIELD_UNCHANGED: read-back or
-	 * written, the shadow now matches the device either way, so there is
-	 * nothing pending. That also makes the natural read-modify-write idiom
-	 * (`cfg = h->config; cfg.x = ...; j30d_update_config()`) safe -- a
-	 * status left at J30D_FIELD_DEFAULT would re-write that register from
-	 * the compiled-in defaults on the next update. */
+	 * Every field ends up J30D_FIELD_UNCHANGED, since the shadow now matches
+	 * the device either way. That is what makes `cfg = h->config; cfg.x =
+	 * ...; j30d_update_config()` safe. */
 	h->config = j30d_default_config;
 
 	if (config != NULL && any_eeprom_field_unchanged(config))
@@ -749,6 +708,9 @@ j30d_err_t j30d_init(j30d_handle_t *h, const j30d_platform_t *platform, const j3
 
 	h->initialized = true;
 	err = J30D_OK;
+
+	/* apply_config()'s COMMAND write has put the device to sleep. */
+	release_bus_to_int(h);
 
 done:
 	handle_unlock(h);
@@ -776,9 +738,11 @@ j30d_err_t j30d_update_config(j30d_handle_t *h, const j30d_config_t *config)
 
 	/* Wake against whatever mode the device is in right now (old config),
 	 * before we potentially change that mode below. */
-	ensure_awake(h);
-
-	j30d_err_t err = apply_config(h, config);
+	j30d_err_t err = ensure_awake(h);
+	if (err == J30D_OK)
+	{
+		err = apply_config(h, config);
+	}
 
 	/* Re-check against the NEW config -- this call may have just turned
 	 * sleep on or off. If it's on (whether newly, or unchanged), put the
@@ -808,6 +772,17 @@ j30d_err_t j30d_get_data(j30d_handle_t *h, j30d_data_t *out)
 		}
 	}
 
+	/* Consumed whether or not it is acted on. It records that at least one
+	 * interrupt arrived, not how many.
+	 *
+	 * It does not override the pacing below. Commanding the device to sleep
+	 * makes it convert and raise INT almost immediately, so answering every
+	 * interrupt with a read would re-command sleep and retrigger the same
+	 * interrupt, and the device would never complete a sleep interval. The
+	 * pacing rejects those: a genuine post-sleep interrupt arrives one
+	 * conversion after the interval has elapsed, so it passes. */
+	h->internal.interrupt_pending = false;
+
 	if (should_skip_get_data_wake(h))
 	{
 		/* Too soon since our last wake for this sleeping device to
@@ -822,7 +797,19 @@ j30d_err_t j30d_get_data(j30d_handle_t *h, j30d_data_t *out)
 		return J30D_OK;
 	}
 
-	ensure_awake(h);
+	{
+		j30d_err_t wake_err = ensure_awake(h);
+		if (wake_err != J30D_OK)
+		{
+			/* The conversion engine could not be stopped, so anything read
+			 * now could tear across a conversion. Leave `out` untouched
+			 * entirely, per the get_data contract in j30d.h. */
+			restore_sleep_if_needed(h);
+			handle_unlock(h);
+			return wake_err;
+		}
+	}
+
 	if (sleep_is_configured(h) && h->platform.now_ms)
 	{
 		h->internal.last_get_data_wake_ms = h->platform.now_ms(h->platform.ctx);
@@ -883,8 +870,8 @@ j30d_err_t j30d_get_data(j30d_handle_t *h, j30d_data_t *out)
 	 * only the converting channel is ever flagged. So: issue the burst if
 	 * EITHER bit is set (one transaction, same as before), but mark only
 	 * the channels the device actually said were ready. Marking both fresh
-	 * off TO1 alone -- as this used to -- reported whatever bytes happened
-	 * to be sitting in the ch2 registers as a new ch2 sample. */
+	 * off TO1 alone would report whatever bytes happen to be sitting in
+	 * the ch2 registers as a new ch2 sample. */
 	if (data_ready & (J30D_TO1_DRDY_Msk | J30D_TO2_DRDY_Msk))
 	{
 		uint8_t buf[6];   /* ch1 (3) + ch2 (3) -- one burst covers both, see file header note */
@@ -993,6 +980,17 @@ j30d_err_t j30d_get_data(j30d_handle_t *h, j30d_data_t *out)
 	return worst;
 }
 
+void j30d_notify_interrupt(j30d_handle_t *h)
+{
+	if (h == NULL)
+	{
+		return;   /* a handler racing teardown must not fault */
+	}
+	/* A single volatile store, and nothing more: no locking and no bus
+	 * access from interrupt context. */
+	h->internal.interrupt_pending = true;
+}
+
 j30d_err_t j30d_raw_read(j30d_handle_t *h, uint8_t reg, uint8_t *buf, size_t len)
 {
 	if (h == NULL || buf == NULL)
@@ -1012,8 +1010,11 @@ j30d_err_t j30d_raw_read(j30d_handle_t *h, uint8_t reg, uint8_t *buf, size_t len
 		}
 	}
 
-	ensure_awake(h);
-	j30d_err_t err = h->platform.i2c_read(h->platform.ctx, reg, buf, len);
+	j30d_err_t err = ensure_awake(h);
+	if (err == J30D_OK)
+	{
+		err = h->platform.i2c_read(h->platform.ctx, reg, buf, len);
+	}
 	restore_sleep_if_needed(h);
 
 	handle_unlock(h);
@@ -1047,8 +1048,11 @@ j30d_err_t j30d_raw_write(j30d_handle_t *h, uint8_t reg, const uint8_t *buf, siz
 		}
 	}
 
-	ensure_awake(h);
-	j30d_err_t err = h->platform.i2c_write(h->platform.ctx, reg, buf, len);
+	j30d_err_t err = ensure_awake(h);
+	if (err == J30D_OK)
+	{
+		err = h->platform.i2c_write(h->platform.ctx, reg, buf, len);
+	}
 	if (err == J30D_OK)
 	{
 		/* Before restore_sleep_if_needed(), so that step re-commits the

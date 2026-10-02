@@ -40,8 +40,7 @@ typedef void (*j30d_delay_ms_fn)(void *ctx, uint32_t ms);
 /* Performs the device's documented "return to IIC idle" sequence: release
  * the I2C peripheral's ownership of SCL/SDA, drive SCL low for >10ms, then
  * hand the pins back to the I2C peripheral. This is not a generic stuck-bus
- * workaround -- per the NSA3300 datasheet (Fig. 6.9, "Communication
- * Interface Conversion Diagram"), holding SCL low for more than 10ms is
+ * workaround, holding SCL low for more than 10ms is
  * the ASIC's own defined path back to IIC idle from wherever it currently
  * is: out of Sleep mode (where SDA is multiplexed as the INT output), or
  * out of PWM/Relay output mode (where SDA is multiplexed as a push-pull
@@ -57,7 +56,10 @@ typedef void (*j30d_delay_ms_fn)(void *ctx, uint32_t ms);
  * it -- it must only be called while the bus lock (below) is held, and if
  * any other I2C device shares this bus, correctness depends on that
  * device's own driver also respecting the same lock (this driver has no
- * way to enforce that on its own -- see j30d_lock_fn). */
+ * way to enforce that on its own -- see j30d_lock_fn).
+ *
+ * If your port implements release_to_int, this must also disable the pin
+ * interrupt before SDA becomes an I2C pin again. */
 typedef void (*j30d_return_to_iic_fn)(void *ctx);
 
 /* Optional. Serializes access to the *physical I2C bus* -- not just this
@@ -79,6 +81,17 @@ typedef void (*j30d_return_to_iic_fn)(void *ctx);
  * letting the caller through, which would silently void the mutual
  * exclusion this hook exists to provide. An implementation that blocks
  * forever, or one that cannot fail, simply always returns true. */
+/* Hand SDA to the device as its INT output and enable the pin interrupt.
+ * Optional; called only in interrupt mode, once the sleep command has been
+ * written. return_to_iic() reclaims the pins.
+ *
+ * Your return_to_iic() must disable the pin interrupt before SDA becomes an
+ * I2C pin again, or every byte on the bus is an edge on that line.
+ *
+ * Interrupt mode makes the I2C bus exclusive to the J30D: while the device
+ * sleeps, SDA is not an I2C pin. Do not use on a shared bus. */
+typedef void (*j30d_release_to_int_fn)(void *ctx);
+
 typedef bool (*j30d_lock_fn)(void *ctx);
 typedef void (*j30d_unlock_fn)(void *ctx);
 
@@ -108,6 +121,7 @@ typedef struct
 	j30d_lock_fn         lock;          /* optional -- see above */
 	j30d_unlock_fn       unlock;        /* optional -- see above */
 	j30d_now_ms_fn       now_ms;        /* optional -- see above */
+	j30d_release_to_int_fn release_to_int; /* optional -- required for interrupt mode */
 	void                 *ctx;          /* passed back to every callback above */
 } j30d_platform_t;
 

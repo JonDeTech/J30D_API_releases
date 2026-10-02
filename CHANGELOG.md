@@ -7,6 +7,11 @@ explicitly below.
 
 Dates are release dates. Releases before 0.5.0 were not tagged.
 
+## 0.6.0 — 2026-10-02
+
+- **Interrupt mode** (`config.interrupt_enable`): the sleep-mode INT line on SDA as a data-ready signal. Requires `platform.release_to_int`, `platform.now_ms` and `SLEEP_EN`, and makes the I²C bus exclusive to this device while it sleeps.
+- **Fixed: a burst read could straddle a conversion.** The conversion engine is now stopped on every wake, so the data registers hold still for the read.
+
 ## 0.5.0 — 2026-09-21
 
 ### Added

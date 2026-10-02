@@ -1,11 +1,10 @@
 /*
  * j30d_internal.h
  *
- * Driver-private working state. This is declared in a header (rather than
- * hidden behind an opaque pointer) only because this driver never
- * heap-allocates -- customers must be able to put a j30d_handle_t on the
- * stack, in .bss, or inside their own struct, which means every member it
- * contains needs a compile-time-known size.
+ * Driver-private working state. This is declared in a header only because
+ * this driver never heap-allocates -- customers must be able to put a
+ * j30d_handle_t on the stack, in .bss, or inside their own struct,
+ * which means every member it contains needs a compile-time-known size.
  *
  * NOTHING in this file is part of the supported API. Field names and layout
  * here can change in any release, including a PATCH one. That is safe ONLY
@@ -44,15 +43,16 @@ typedef struct
 	 * double as "never woken yet". */
 	uint32_t      last_get_data_wake_ms;
 	bool          get_data_has_woken;
-} j30d_internal_t;
 
-/* Removed: `channel` (this driver has no active-channel selection -- see
- * the design note at the top of j30d.c, it always reports both ch1/ch2)
- * and `sleep_enabled` (sleep-configured is derived on the fly from
- * h->config.command.value, see sleep_is_configured() in j30d.c -- there
- * was never a second copy of that bit to keep in sync). Neither was ever
- * read anywhere in this driver; if you had code referencing them, use
- * h->config.command.value & J30D_COMMAND_SLEEP_EN instead. */
+	/* Set by j30d_notify_interrupt() from interrupt context, consumed by the
+	 * next j30d_get_data(). volatile because the two run in different
+	 * contexts; a single bool store needs no locking.
+	 *
+	 * Bypasses the pacing above: samples arrive one sleep interval plus one
+	 * conversion apart, so pacing on the interval alone rejects ready
+	 * reads. */
+	volatile bool interrupt_pending;
+} j30d_internal_t;
 
 #ifdef __cplusplus
 }

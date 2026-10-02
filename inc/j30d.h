@@ -3,7 +3,7 @@
  *
  * Public API for the J30D / JIRS30D sensor driver.
  *
- * Design summary (see design discussion for the full rationale):
+ * Design summary:
  *  - No global/static driver state anywhere -- every call takes an explicit
  *    j30d_handle_t*, so multiple sensors (multiple handles) are naturally
  *    supported and two threads touching *different* handles are safe with
@@ -24,7 +24,8 @@
  *    same time".
  *  - Sleep is handled for you. If sleep ends up enabled in h->config
  *    (whether via j30d_init()'s config or a later j30d_update_config()),
- *    every call below that needs the bus wakes the device first and
+ *    every call below that needs the bus wakes the device, stops the
+ *    conversion engine so a burst read cannot straddle a conversion, and
  *    re-commands sleep afterward, automatically. There is no public
  *    "wake" call and none of the functions below need you to think about
  *    whether the device happens to be asleep right now.
@@ -129,18 +130,11 @@ j30d_err_t j30d_update_config(j30d_handle_t *h, const j30d_config_t *config);
 
 /*
  * Refreshes all of `out`'s fields (ch1, ch2, amb, raw_ch1, raw_ch2,
- * raw_amb) in one call -- there is no way to ask for only some of them.
- * This used to take a `select` bitmask so callers could read only the
- * groups they needed, but the device's DATA_READY/DATA_READY_RAW status
- * registers clear ALL of their bits as a side effect of being *read*, not
- * just the bits belonging to whichever fields you go on to actually fetch.
- * That made partial selection actively dangerous: polling for one group
- * (e.g. J30D_SELECT_CAL alone, in a loop) could silently clear another
- * group's DRDY bit (e.g. ambient's) on every status read without ever
- * consuming that data, starving a caller that asks for it later. Always
- * reading everything the status registers say is ready removes that
- * failure mode entirely -- you just look at which fields came back
- * J30D_FRESH this call and ignore the rest, same as before.
+ * raw_amb) in one call; a subset cannot be requested. Reading the
+ * DATA_READY/DATA_READY_RAW status registers clears every DRDY bit,
+ * including those for fields you did not fetch, so a partial read would
+ * starve them. Look at which fields came back J30D_FRESH and ignore the
+ * rest.
  *
  * For each of the six fields, if the device's corresponding DRDY bit was
  * set, the register(s) are read and the field is marked J30D_FRESH; if
@@ -158,16 +152,21 @@ j30d_err_t j30d_update_config(j30d_handle_t *h, const j30d_config_t *config);
  * unchanged.
  *
  * The function's own return code reflects transport health only: J30D_OK
- * unless the initial status-register read failed (nothing in `out` is
- * touched in that case) or at least one field's read failed
- * (J30D_ERR_I2C/TIMEOUT -- check per-field .state in `out` to see which).
+ * unless the wake failed to stop the conversion engine, or the initial
+ * status-register read failed (in both cases nothing in `out` is touched),
+ * or at least one field's read failed (J30D_ERR_I2C/TIMEOUT -- check
+ * per-field .state in `out` to see which).
  *
  * Returns J30D_ERR_NOT_INIT if called before a successful j30d_init().
- * Wakes the device first (and re-commands sleep afterward) if sleep is
- * currently configured -- see the file header note on sleep handling.
+ * Wakes the device and stops the conversion engine first (and re-commands
+ * sleep afterward) if sleep is currently configured -- see the file header
+ * note on sleep handling.
  *
- * Paced to the sleep interval if platform.now_ms is set: if sleep is
- * configured and less time than the configured sleep interval has passed
+ * Paced to the sleep interval if platform.now_ms is set -- or to half of it
+ * in interrupt mode, where the pacing must also reject the INT the device
+ * raises a few ms after every sleep command without rejecting a genuine one
+ * from a part whose untrimmed sleep timer runs fast. If sleep is
+ * configured and less time than that has passed
  * since this function last actually woke the device, it returns
  * immediately without touching the bus at all -- `out` is filled from the
  * same last known-good data as always, with every field's .state forced
@@ -198,8 +197,7 @@ j30d_err_t j30d_get_data(j30d_handle_t *h, j30d_data_t *out);
  * h->config's shadow to match, before the automatic re-sleep step runs. So
  * writing COMMAND here does what it says: clear SLEEP_EN and the device is
  * left awake, set it and the device sleeps, and h->config agrees either
- * way. (It did NOT always work like this: the re-sleep step used to
- * re-write the OLD shadow value and silently undo the write.)
+ * way.
  *
  * The one raw write still outside this: J30D_REG_SOFT_RESET. That resets
  * the device and reloads EEPROM behind the driver's back, invalidating the
@@ -229,6 +227,20 @@ j30d_err_t j30d_get_data(j30d_handle_t *h, j30d_data_t *out);
  * They are build-time switches so that enabling one is a decision recorded
  * in the build, not something a stray call can reach.
  */
+/* Records an interrupt on the J30D's INT line. The only function here that
+ * may be called from interrupt context: it stores one flag, nothing else.
+ *
+ * Call it from your EXTI handler, then signal a task and call
+ * j30d_get_data() from that task -- never from the handler, which would
+ * block for tens of milliseconds and, on an RTOS port, sleep.
+ *
+ * The flag is recorded only: it does not change what the next
+ * j30d_get_data() does. The sleep-interval pacing applies to
+ * interrupt-driven reads too, and is what rejects the extra interrupt the
+ * device raises a few ms after every sleep command. Extra calls are
+ * harmless, as is calling it with interrupt mode off. h may be NULL. */
+void j30d_notify_interrupt(j30d_handle_t *h);
+
 j30d_err_t j30d_raw_read(j30d_handle_t *h, uint8_t reg, uint8_t *buf, size_t len);
 j30d_err_t j30d_raw_write(j30d_handle_t *h, uint8_t reg, const uint8_t *buf, size_t len);
 

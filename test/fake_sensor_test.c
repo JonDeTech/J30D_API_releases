@@ -14,28 +14,34 @@ typedef struct
 	uint8_t  regs[256];
 	int      fail_next_read;
 	int      fail_next_write;
+	uint8_t  fail_read_reg;     /* next read of THIS register fails; 0 = off. 0x00 is
+	                             * SOFT_RESET, which is write-only, so no read can
+	                             * collide with the disabled value. Lets a test fail one
+	                             * field read while the status read still succeeds. */
 	int      return_to_iic_calls;
 	int      i2c_read_calls;     /* every fake_read() call, pass or fail -- proves whether the bus was touched at all */
 	uint32_t virtual_now_ms;     /* driven by the test, read back by fake_now_ms() */
 	int      lock_calls;
 	int      unlock_calls;
 	int      lock_should_fail;   /* when set, fake_lock() reports it could not acquire */
-	/* I2C addressing, as measured on hardware by J30D_LiveTest_AddressProbe():
-	 * writing CHIP_ADDRESS moves the device IMMEDIATELY -- no EEPROM, no
-	 * reset -- and the 0x7F wildcard keeps answering alongside whatever
-	 * address is set. */
+	/* CHIP_ADDRESS takes effect immediately; 0x7F answers alongside it. */
 	uint8_t  bus_addr;           /* address the port is driving */
 	uint8_t  chip_addr;          /* address the device currently answers on */
+	/* A wake leaves MODE_EN set, so the device comes back converting.
+	 * reads_while_converting counts any read taken while it does. */
+	int      converting;
+	int      reads_while_converting;
+	/* Interrupt mode: the device owns SDA while it sleeps. */
+	int      bus_released;
+	int      release_calls;
+	int      reads_while_released;
 	int      device_asleep;      /* models real hardware: once COMMAND lands with SLEEP_EN set, the
 	                               * device stops ACKing anything until the next return_to_iic() wake --
 	                               * this is what apply_config()'s write ordering has to survive. */
 } fake_ctx_t;
 
-/* Every fake context starts on the 0x7F wildcard, because that is what the
- * reference ports target and what makes the driver survive a chip_address
- * change. A context left at address 0 only works while the compiled-in
- * default leaves chip_address UNCHANGED -- edit that default (as a customer
- * would) and the device moves out from under the test. */
+/* Every fake context starts on the 0x7F wildcard, as the reference ports do.
+ * A context at address 0 would break as soon as chip_address is set. */
 #define FAKE_CTX_INIT  { .bus_addr = 0x7Fu }
 
 /* The part answers its own address and, always, the 0x7F wildcard. */
@@ -50,17 +56,19 @@ static j30d_err_t fake_read(void *ctx, uint8_t reg, uint8_t *buf, size_t len)
 	c->i2c_read_calls++;
 	if (!fake_addressed(c)) { return J30D_ERR_I2C; }
 	if (c->device_asleep) { return J30D_ERR_I2C; }
+	if (c->converting && reg == J30D_REG_DATA_READY) { c->reads_while_converting++; }
+	if (c->bus_released) { c->reads_while_released++; return J30D_ERR_I2C; }
 	if (c->fail_next_read) { c->fail_next_read = 0; return J30D_ERR_I2C; }
+	if (c->fail_read_reg && reg == c->fail_read_reg) { c->fail_read_reg = 0; return J30D_ERR_I2C; }
 	memcpy(buf, &c->regs[reg], len);
 	/* Models real hardware (per field observation): reading DATA_READY/
 	 * DATA_READY_RAW clears ALL of their bits, not just the ones the
 	 * caller goes on to act on. j30d_get_data() reads both in the same
 	 * 3-byte burst starting at J30D_REG_DATA_READY -- this is the only
 	 * call site that ever hits this address, so gating on `reg` alone is
-	 * enough to model it here. This is exactly the hazard the removed
-	 * `select` parameter used to hide: a caller that only reads out some
-	 * of the groups this same call saw ready would silently lose the
-	 * DRDY for the rest, since it's gone by the next status read. */
+	 * enough to model it here. A caller that reads out only some of the
+	 * groups this call saw ready loses the DRDY for the rest, since it is
+	 * gone by the next status read. */
 	if (reg == J30D_REG_DATA_READY)
 	{
 		c->regs[J30D_REG_DATA_READY]     &= (uint8_t)~(J30D_TA_DRDY_Msk | J30D_TO1_DRDY_Msk | J30D_TO2_DRDY_Msk);
@@ -73,6 +81,7 @@ static j30d_err_t fake_write(void *ctx, uint8_t reg, const uint8_t *buf, size_t 
 {
 	fake_ctx_t *c = (fake_ctx_t *)ctx;
 	if (!fake_addressed(c)) { return J30D_ERR_I2C; }
+	if (c->bus_released) { return J30D_ERR_I2C; }
 	if (c->device_asleep) { return J30D_ERR_I2C; }
 	if (c->fail_next_write) { c->fail_next_write = 0; return J30D_ERR_I2C; }
 	memcpy(&c->regs[reg], buf, len);
@@ -84,12 +93,33 @@ static j30d_err_t fake_write(void *ctx, uint8_t reg, const uint8_t *buf, size_t 
 	/* Mirrors real hardware: this write itself still succeeds (the device
 	 * was awake to ACK it) -- it's every access AFTER this one that fails,
 	 * until the next wake. */
-	if (reg == J30D_REG_COMMAND) { c->device_asleep = (buf[0] & J30D_COMMAND_SLEEP_EN) ? 1 : 0; }
+	if (reg == J30D_REG_COMMAND)
+	{
+		c->device_asleep = (buf[0] & J30D_COMMAND_SLEEP_EN) ? 1 : 0;
+		c->converting    = ((buf[0] & J30D_COMMAND_MODE_EN) && !c->device_asleep) ? 1 : 0;
+	}
 	return J30D_OK;
 }
 
 static void fake_delay(void *ctx, uint32_t ms) { (void)ctx; (void)ms; }
-static void fake_return_to_iic(void *ctx) { fake_ctx_t *c = (fake_ctx_t *)ctx; c->return_to_iic_calls++; c->device_asleep = 0; }
+/* The wake clears SLEEP_EN but not MODE_EN, so the device resumes
+ * converting. */
+static void fake_return_to_iic(void *ctx)
+{
+	fake_ctx_t *c = (fake_ctx_t *)ctx;
+	c->return_to_iic_calls++;
+	c->bus_released  = 0;   /* the pins come back here, and only here */
+	c->device_asleep = 0;
+	c->converting    = (c->regs[J30D_REG_COMMAND] & J30D_COMMAND_MODE_EN) ? 1 : 0;
+}
+/* Interrupt mode only -- the driver must not call this otherwise. */
+static void fake_release_to_int(void *ctx)
+{
+	fake_ctx_t *c = (fake_ctx_t *)ctx;
+	c->release_calls++;
+	c->bus_released = 1;
+}
+
 static uint32_t fake_now_ms(void *ctx) { return ((fake_ctx_t *)ctx)->virtual_now_ms; }
 
 static bool fake_lock(void *ctx)
@@ -118,15 +148,15 @@ static void set_cal(fake_ctx_t *c, int32_t ch1_raw, int32_t ch2_raw)
 	c->regs[J30D_REG_CAL_MSB + 5] = (uint8_t)ch2_raw;
 	/* Stages a sample for BOTH channels, so raise both channels' DRDY bits
 	 * -- ch1 and ch2 have separate bits and the driver gates each field on
-	 * its own. Raising only TO1 here (as this used to) modelled a device
-	 * that never flags ch2, which is what set_cal_ch1_only() below is for. */
+	 * its own. Raising only TO1 would model a device that never flags ch2,
+	 * which is what set_cal_ch1_only() below is for. */
 	c->regs[J30D_REG_DATA_READY] |= J30D_TO1_DRDY_Msk | J30D_TO2_DRDY_Msk;
 }
 
 /* Stages a ch1 sample only: ch1's DRDY is raised, ch2's is not, but the ch2
  * registers still hold whatever bytes were there. This is what the device
- * actually looks like in single-conversion mode, and the case that used to
- * be misreported as a fresh ch2 sample. */
+ * actually looks like in single-conversion mode: ch2 must come back
+ * stale, not fresh. */
 static void set_cal_ch1_only(fake_ctx_t *c, int32_t ch1_raw, int32_t stale_ch2_bytes)
 {
 	set_cal(c, ch1_raw, stale_ch2_bytes);
@@ -192,14 +222,31 @@ static void set_calibration_rev2(fake_ctx_t *c, float offset1, float gain1)
 	test_put_be16(&b[J30D_CAL_OFF_CHECKSUM], crc);
 }
 
+/* The defaults, minus interrupt mode.
+ *
+ * j30d_default_config is the customer's file to edit, so the suite must not
+ * depend on what they set interrupt_enable to. It cannot simply honour it
+ * either: interrupt mode requires platform.now_ms, and this suite runs on a
+ * deliberately clockless platform to prove the no-clock fallback (see the
+ * pacing section near the end). So tests that just want "the defaults" use
+ * this copy. Interrupt mode has its own block, with a clock. */
+static j30d_config_t suite_cfg;
+
 int main(void)
 {
 	fake_ctx_t ctx = FAKE_CTX_INIT;
 	j30d_platform_t platform = {
 		.i2c_read = fake_read, .i2c_write = fake_write,
 		.delay_ms = fake_delay, .return_to_iic = fake_return_to_iic,
-		.lock = NULL, .unlock = NULL, .ctx = &ctx,
+		.lock = NULL, .unlock = NULL,
+		/* A capable port: j30d_default_config is the customer's file to edit,
+		 * so these tests must not depend on what they set interrupt_enable to. */
+		.release_to_int = fake_release_to_int,
+		.ctx = &ctx,
 	};
+
+	suite_cfg = j30d_default_config;
+	suite_cfg.interrupt_enable = false;
 
 	/* Seed a valid REV2PLUS calibration block *before* init reads it. */
 	set_calibration_rev2(&ctx, -2.5f, 10.75f);
@@ -207,7 +254,7 @@ int main(void)
 	j30d_handle_t h;
 
 	/* --- init with defaults --- */
-	assert(j30d_init(&h, &platform, NULL) == J30D_OK);
+	assert(j30d_init(&h, &platform, &suite_cfg) == J30D_OK);
 	assert(h.initialized);
 	assert(ctx.return_to_iic_calls == 1);
 	assert(ctx.regs[J30D_REG_SYS_CFG1] == j30d_default_config.sys_cfg1.value);
@@ -238,7 +285,7 @@ int main(void)
 		set_calibration_rev2(&bad_ctx, 1.0f, 1.0f);
 		bad_ctx.regs[J30D_REG_CUSTOM_MEMORY_START + J30D_CAL_OFF_CHECKSUM] ^= 0xFF;   /* corrupt it */
 		j30d_handle_t bad_h;
-		assert(j30d_init(&bad_h, &bad_platform, NULL) == J30D_OK);   /* bad calib must not fail init */
+		assert(j30d_init(&bad_h, &bad_platform, &suite_cfg) == J30D_OK);   /* bad calib must not fail init */
 		assert(bad_h.calib.valid);   /* the read+parse itself succeeded */
 		assert(bad_h.calib.version == J30D_UNIT_VERSION_UNKNOWN);   /* but the CRC didn't check out */
 		printf("calibration (REV2PLUS, corrupted CRC) -> UNKNOWN OK\n");
@@ -251,7 +298,7 @@ int main(void)
 		ff_platform.ctx = &ff_ctx;
 		memset(&ff_ctx.regs[J30D_REG_CUSTOM_MEMORY_START], 0xFF, J30D_CUSTOM_MEMORY_SIZE);
 		j30d_handle_t ff_h;
-		assert(j30d_init(&ff_h, &ff_platform, NULL) == J30D_OK);
+		assert(j30d_init(&ff_h, &ff_platform, &suite_cfg) == J30D_OK);
 		assert(ff_h.calib.valid);
 		assert(ff_h.calib.version == J30D_UNIT_VERSION_CH2);
 #if defined(J30D_NO_FLOAT)
@@ -282,7 +329,7 @@ int main(void)
 		memset(&b[J30D_CAL_OFF_CHECKSUM], 0xFF, 2);                 /* blank, as on these units */
 
 		j30d_handle_t old_h;
-		assert(j30d_init(&old_h, &old_platform, NULL) == J30D_OK);
+		assert(j30d_init(&old_h, &old_platform, &suite_cfg) == J30D_OK);
 		assert(old_h.calib.valid);
 		assert(old_h.calib.version == J30D_UNIT_VERSION_CH1_NOTIMESTAMP);
 		assert(old_h.calib.uid == 51u);
@@ -326,7 +373,7 @@ int main(void)
 		combined.command.status  = J30D_FIELD_UPDATED;
 		combined.command.value   = j30d_default_config.command.value | J30D_COMMAND_SLEEP_EN;
 		assert(j30d_update_config(&h, &combined) == J30D_OK);
-		assert(ctx.regs[J30D_REG_SYS_CFG1] == 0xE1);          /* would still be the old value under the old (broken) order */
+		assert(ctx.regs[J30D_REG_SYS_CFG1] == 0xE1);          /* written before COMMAND, so it lands while the device is awake */
 		assert(ctx.regs[J30D_REG_COMMAND] & J30D_COMMAND_SLEEP_EN);
 		assert(h.config.sys_cfg1.value == 0xE1);
 
@@ -383,14 +430,10 @@ int main(void)
 	assert(d.amb.raw_code == -16384);   /* still last known-good */
 	printf("get_data (stale keeps last value) OK\n");
 
-	/* --- regression: get_data() must not lose a group's data to a status
-	 * read that clears DRDY bits it didn't itself consume. This is the bug
-	 * the old `select` parameter caused on real hardware: a caller polling
-	 * for CAL only would read (and thus clear, per fake_read() above) an
-	 * AMB DRDY it never went on to fetch, starving a later AMB-only call
-	 * forever. Now that a single call always reads every group whose DRDY
-	 * came back set in the SAME status read, both must come back fresh
-	 * together, with nothing to starve. */
+	/* --- get_data() reads every group whose DRDY came back set in the same
+	 * status read, so a group cannot be starved by a status read that
+	 * cleared its bit without consuming it: both come back fresh
+	 * together. */
 	set_amb(&ctx, 2048);
 	set_cal(&ctx, 100, -200);
 	assert(j30d_get_data(&h, &d) == J30D_OK);
@@ -443,8 +486,8 @@ int main(void)
 		assert(d.raw_amb.state == J30D_STALE);
 		printf("get_data: raw group gated per-bit, unflagged raw fields stay STALE OK\n");
 
-		/* A ch2-only raw sample must still be read -- TO2_RAW was missing
-		 * from the read condition entirely, so this used to be dropped. */
+		/* A ch2-only raw sample must still be read: TO2_RAW alone is
+		 * enough to require the burst. */
 		set_raw(&ctx, 0x0A0B0C, 0x0D0E0F, 0x101112, J30D_TO2_RAW_DRDY_Msk);
 		assert(j30d_get_data(&h, &d) == J30D_OK);
 		assert(d.raw_ch2.state == J30D_FRESH);
@@ -454,30 +497,44 @@ int main(void)
 		printf("get_data: TO2_RAW-only sample is read, not dropped OK\n");
 	}
 
-	/* --- get_data: DRDY set but the read of that field fails -> J30D_ERROR, value unchanged, call returns error --- */
-	ctx.regs[J30D_REG_DATA_READY] |= J30D_TA_DRDY_Msk;
-	ctx.fail_next_read = 1;   /* status read still consumes one "fail" slot below, so set flag after status read instead */
-	/* status read must succeed, only the subsequent amb read should fail --
-	 * do it manually: read status first for real by calling get_data once
-	 * won't let us inject a fail mid-call with this simple harness, so
-	 * instead verify the same effect using a write failure inside
-	 * update_config, which the harness supports directly. */
-	ctx.fail_next_read = 0;
+	/* --- get_data: DRDY set but that field's own read fails ---
+	 * j30d.h promises J30D_ERROR for the field, the last known-good value
+	 * kept, and the transport error returned from the call. Failing the
+	 * ambient read by register leaves the status read intact, which is the
+	 * whole point -- the driver has to see DRDY set and then fail to act on
+	 * it. */
+	{
+		j30d_data_t fd;
 
-	j30d_config_t bad = {0};
-	bad.bias_cfg.status = J30D_FIELD_UPDATED;
-	bad.bias_cfg.value  = 0x01;
-	ctx.fail_next_write = 1;
-	assert(j30d_update_config(&h, &bad) == J30D_ERR_I2C);
-	/* shadow must NOT have been updated on a failed write */
-	assert(h.config.bias_cfg.status != J30D_FIELD_UNCHANGED || h.config.bias_cfg.value != 0x01);
-	printf("update_config write-failure leaves shadow untouched OK\n");
+		set_amb(&ctx, 4096);
+		ctx.regs[J30D_REG_DATA_READY] |= J30D_TA_DRDY_Msk;
+		assert(j30d_get_data(&h, &fd) == J30D_OK);
+		assert(fd.amb.state == J30D_FRESH);
+		assert(fd.amb.raw_code == 4096);   /* the known-good value to fall back to */
 
-	/* --- chip_address is an ordinary runtime setting ---------------------
-	 * Measured on hardware (J30D_LiveTest_AddressProbe): writing 0x92 moves
-	 * the device immediately, no EEPROM and no reset, and 0x7F keeps
-	 * answering. So it is applied at init like every other field, and the
-	 * driver has no EEPROM-write path at all. */
+		set_amb(&ctx, 8192);               /* the value the failing read must not reach */
+		ctx.regs[J30D_REG_DATA_READY] |= J30D_TA_DRDY_Msk;
+		ctx.fail_read_reg = J30D_REG_AMB_MSB;
+
+		assert(j30d_get_data(&h, &fd) == J30D_ERR_I2C);
+		assert(fd.amb.state == J30D_ERROR);
+		assert(fd.amb.raw_code == 4096);   /* unchanged, not 8192 */
+		assert(ctx.fail_read_reg == 0);    /* the injection really fired */
+		printf("get_data: a failed field read reports J30D_ERROR and keeps the last value OK\n");
+	}
+
+	/* --- update_config: a failed write must not move the shadow --- */
+	{
+		j30d_config_t bad = {0};
+		bad.bias_cfg.status = J30D_FIELD_UPDATED;
+		bad.bias_cfg.value  = 0x01;
+		ctx.fail_next_write = 1;
+		assert(j30d_update_config(&h, &bad) == J30D_ERR_I2C);
+		assert(h.config.bias_cfg.status != J30D_FIELD_UNCHANGED || h.config.bias_cfg.value != 0x01);
+		printf("update_config write-failure leaves shadow untouched OK\n");
+	}
+
+	/* --- chip_address: takes effect immediately, 0x7F keeps answering --- */
 	{
 		fake_ctx_t ad_ctx = FAKE_CTX_INIT;
 		j30d_platform_t ad_platform = platform;
@@ -487,7 +544,7 @@ int main(void)
 		 * than via NULL: j30d_default_config is the customer's file to edit,
 		 * so what it holds is not this test's business. */
 		{
-			j30d_config_t leave = j30d_default_config;
+			j30d_config_t leave = suite_cfg;
 			leave.chip_address.status = J30D_FIELD_UNCHANGED;
 
 			j30d_handle_t ad_h;
@@ -499,7 +556,7 @@ int main(void)
 
 		/* UPDATED writes it, and the device really moves. */
 		{
-			j30d_config_t want = j30d_default_config;
+			j30d_config_t want = suite_cfg;
 			want.chip_address.status = J30D_FIELD_UPDATED;
 			want.chip_address.value  = 0x10;
 
@@ -518,7 +575,7 @@ int main(void)
 		/* Re-applying the same address is harmless, and a different one moves
 		 * it again -- there is nothing stored, so no idempotence to manage. */
 		{
-			j30d_config_t again = j30d_default_config;
+			j30d_config_t again = suite_cfg;
 			again.chip_address.status = J30D_FIELD_UPDATED;
 			again.chip_address.value  = 0x11;
 
@@ -529,6 +586,164 @@ int main(void)
 		}
 	}
 
+	/* --- interrupt mode: minimum threshold so every sample raises INT, and
+	 * SDA handed to the device on entry to sleep --- */
+	{
+		/* Without platform.release_to_int the line could never fire, so init
+		 * refuses rather than leaving a silently dead interrupt. */
+		{
+			fake_ctx_t i_ctx = FAKE_CTX_INIT;
+			j30d_platform_t no_hook = platform;
+			no_hook.release_to_int = NULL;   /* the whole point of this case */
+			no_hook.ctx = &i_ctx;
+
+			j30d_config_t want = j30d_default_config;
+			want.interrupt_enable = true;
+
+			j30d_handle_t i_h;
+			assert(j30d_init(&i_h, &no_hook, &want) == J30D_ERR_PARAM);
+			printf("interrupt mode without release_to_int is refused OK\n");
+		}
+
+		/* Without platform.now_ms there is no pacing, and the pacing is the
+		 * only thing that rejects the extra interrupt the device raises a few
+		 * ms after every sleep command. Refuse rather than ship a loop that
+		 * never lets the device finish a sleep interval. */
+		{
+			fake_ctx_t i_ctx = FAKE_CTX_INIT;
+			j30d_platform_t no_clock = platform;
+			no_clock.now_ms = NULL;          /* the whole point of this case */
+			no_clock.ctx = &i_ctx;
+
+			j30d_config_t want = j30d_default_config;
+			want.interrupt_enable = true;
+
+			j30d_handle_t i_h;
+			assert(j30d_init(&i_h, &no_clock, &want) == J30D_ERR_PARAM);
+			printf("interrupt mode without now_ms is refused OK\n");
+		}
+
+		/* INT is the sleep-mode comparator output on SDA. With SLEEP_EN clear
+		 * the pin is never handed to the device, so nothing can ever fire --
+		 * refuse rather than accept a configuration that initialises cleanly
+		 * and then signals nothing. */
+		{
+			fake_ctx_t i_ctx = FAKE_CTX_INIT;
+			j30d_platform_t s_platform = platform;
+			s_platform.now_ms         = fake_now_ms;
+			s_platform.release_to_int = fake_release_to_int;
+			s_platform.ctx            = &i_ctx;
+
+			j30d_config_t want = j30d_default_config;
+			want.interrupt_enable = true;
+			want.command.status   = J30D_FIELD_UPDATED;
+			want.command.value    = (uint8_t)(j30d_default_config.command.value &
+			                                  ~J30D_COMMAND_SLEEP_EN);   /* no sleep */
+
+			j30d_handle_t i_h;
+			assert(j30d_init(&i_h, &s_platform, &want) == J30D_ERR_PARAM);
+			printf("interrupt mode without SLEEP_EN is refused OK\n");
+		}
+
+		/* With the hook: threshold floored, polarity checked, bus released. */
+		{
+			fake_ctx_t i_ctx = FAKE_CTX_INIT;
+			j30d_platform_t i_platform = platform;
+			i_platform.ctx            = &i_ctx;
+			i_platform.release_to_int = fake_release_to_int;
+			i_platform.now_ms         = fake_now_ms;   /* interrupt mode requires it */
+
+			j30d_config_t want = j30d_default_config;
+			want.interrupt_enable = true;
+			assert(want.command.value & J30D_COMMAND_SLEEP_EN);   /* INT only exists in sleep */
+
+			j30d_handle_t i_h;
+			assert(j30d_init(&i_h, &i_platform, &want) == J30D_OK);
+
+			/* 0x8000 == -128mV, below anything the part can read */
+			assert(i_ctx.regs[J30D_REG_T_THRESHOLD_SLEEP_MSB] == 0x80);
+			assert(i_ctx.regs[J30D_REG_T_THRESHOLD_SLEEP_LSB] == 0x00);
+			assert(i_ctx.release_calls > 0);
+			assert(i_ctx.bus_released);            /* device owns SDA now */
+			assert(i_ctx.reads_while_released == 0);
+			printf("interrupt mode floors the threshold and releases the bus OK\n");
+
+			/* A read still works: ensure_awake() reclaims the pins first. */
+			int rel_before = i_ctx.release_calls;
+			j30d_data_t id;
+			assert(j30d_get_data(&i_h, &id) == J30D_OK);
+			assert(i_ctx.reads_while_released == 0);   /* never read a released bus */
+			assert(i_ctx.release_calls == rel_before + 1);   /* and released it again after */
+			assert(i_ctx.bus_released);
+			printf("get_data reclaims the bus, reads, and releases it again OK\n");
+
+			/* SLEEP_POL == 1 is "trigger when LOWER", which a floor threshold
+			 * never satisfies. Refused rather than configured to do nothing. */
+			{
+				fake_ctx_t pol_ctx = FAKE_CTX_INIT;
+				pol_ctx.regs[J30D_REG_SYS_CFG2] = J30D_SYS_CFG2_SLEEP_POL_Msk;
+				j30d_platform_t pol_platform = i_platform;
+				pol_platform.ctx = &pol_ctx;
+
+				j30d_config_t pol_want = j30d_default_config;
+				pol_want.interrupt_enable = true;
+				pol_want.sys_cfg2.status  = J30D_FIELD_UNCHANGED;   /* keep the device value */
+
+				j30d_handle_t pol_h;
+				assert(j30d_init(&pol_h, &pol_platform, &pol_want) == J30D_ERR_PARAM);
+				printf("interrupt mode refuses SLEEP_POL=1 (floor would never fire) OK\n");
+			}
+		}
+
+		/* j30d_notify_interrupt() does not bypass get_data pacing. The device
+		 * raises INT a few ms after every sleep command, so the flag alone
+		 * cannot mean a sample is ready -- only the elapsed time can. */
+		{
+			fake_ctx_t n_ctx = FAKE_CTX_INIT;
+			j30d_platform_t n_platform = platform;
+			n_platform.ctx            = &n_ctx;
+			n_platform.now_ms         = fake_now_ms;
+			n_platform.release_to_int = fake_release_to_int;
+
+			j30d_config_t want = j30d_default_config;
+			want.interrupt_enable = true;
+			want.sleep.status     = J30D_FIELD_UPDATED;
+			want.sleep.value      = 0x00;   /* 100ms */
+
+			j30d_handle_t n_h;
+			assert(j30d_init(&n_h, &n_platform, &want) == J30D_OK);
+
+			j30d_data_t nd;
+			n_ctx.virtual_now_ms = 1000;
+			assert(j30d_get_data(&n_h, &nd) == J30D_OK);   /* first one always wakes */
+
+			/* 10ms later: far inside the interval, so pacing refuses to wake. */
+			n_ctx.virtual_now_ms = 1010;
+			int woke_before = n_ctx.return_to_iic_calls;
+			assert(j30d_get_data(&n_h, &nd) == J30D_OK);
+			assert(n_ctx.return_to_iic_calls == woke_before);   /* paced out */
+
+			/* An interrupt inside the interval must NOT force a read.
+			 * Commanding the device to sleep makes it convert and raise INT
+			 * almost immediately; acting on that would re-command sleep and
+			 * retrigger it, and the device would never complete a sleep
+			 * interval. */
+			j30d_notify_interrupt(&n_h);
+			assert(j30d_get_data(&n_h, &nd) == J30D_OK);
+			assert(n_ctx.return_to_iic_calls == woke_before);   /* still paced out */
+			printf("an interrupt inside the sleep interval does not force a wake\n");
+
+			/* Past the interval it wakes, interrupt or not -- a genuine
+			 * post-sleep interrupt arrives one conversion after it elapses. */
+			n_ctx.virtual_now_ms = 1200;
+			j30d_notify_interrupt(&n_h);
+			assert(j30d_get_data(&n_h, &nd) == J30D_OK);
+			assert(n_ctx.return_to_iic_calls == woke_before + 1);
+			printf("a post-interval interrupt is served\n");
+
+			j30d_notify_interrupt(NULL);   /* must not fault */
+		}
+	}
 	/* --- NULL/param guards --- */
 	assert(j30d_init(NULL, &platform, NULL) == J30D_ERR_PARAM);
 	assert(j30d_get_data(&h, NULL) == J30D_ERR_PARAM);
@@ -548,7 +763,7 @@ int main(void)
 		j30d_platform_t d_platform = platform;
 		d_platform.ctx = &d_ctx;
 		j30d_handle_t d_h;
-		assert(j30d_init(&d_h, &d_platform, NULL) == J30D_OK);
+		assert(j30d_init(&d_h, &d_platform, &suite_cfg) == J30D_OK);
 
 		const uint8_t good_cfg1 = d_ctx.regs[J30D_REG_SYS_CFG1];
 		assert((good_cfg1 & J30D_SYS_CFG1_OUT_MODE_Msk) == J30D_SYS_CFG1_OUT_I2C);
@@ -630,7 +845,7 @@ int main(void)
 		j30d_platform_t r_platform = platform;
 		r_platform.ctx = &r_ctx;
 		j30d_handle_t r_h;
-		assert(j30d_init(&r_h, &r_platform, NULL) == J30D_OK);
+		assert(j30d_init(&r_h, &r_platform, &suite_cfg) == J30D_OK);
 		/* Shipped default is sleep-ON, so the re-arm step is live. */
 		assert(r_h.config.command.value & J30D_COMMAND_SLEEP_EN);
 
@@ -638,8 +853,8 @@ int main(void)
 		uint8_t awake = j30d_default_config.command.value & (uint8_t)~J30D_COMMAND_SLEEP_EN;
 		assert(j30d_raw_write(&r_h, J30D_REG_COMMAND, &awake, 1) == J30D_OK);
 
-		/* The device must be left awake and STAY that way -- this is the
-		 * exact case that used to be reverted on the way out of the call. */
+		/* The device must be left awake and STAY that way: the automatic
+		 * re-sleep step must not revert it on the way out. */
 		assert(r_ctx.regs[J30D_REG_COMMAND] == awake);
 		assert((r_ctx.regs[J30D_REG_COMMAND] & J30D_COMMAND_SLEEP_EN) == 0);
 		assert(r_h.config.command.value == awake);
@@ -719,7 +934,7 @@ int main(void)
 		l_platform.unlock = fake_unlock;
 
 		j30d_handle_t l_h;
-		assert(j30d_init(&l_h, &l_platform, NULL) == J30D_OK);
+		assert(j30d_init(&l_h, &l_platform, &suite_cfg) == J30D_OK);
 		assert(l_ctx.lock_calls == 1 && l_ctx.unlock_calls == 1);   /* balanced */
 
 		j30d_data_t ld;
@@ -744,7 +959,7 @@ int main(void)
 		/* And a re-init through a failing lock must also refuse. */
 		{
 			j30d_handle_t l_h2;
-			assert(j30d_init(&l_h2, &l_platform, NULL) == J30D_ERR_TIMEOUT);
+			assert(j30d_init(&l_h2, &l_platform, &suite_cfg) == J30D_ERR_TIMEOUT);
 		}
 
 		/* Recovering the lock restores normal operation. */
@@ -756,10 +971,10 @@ int main(void)
 
 	/* --- j30d_init() and J30D_FIELD_UNCHANGED ---------------------------
 	 * COMMAND/SLEEP_TIME are RAM registers that init's own soft reset
-	 * clears, so UNCHANGED is rejected for them: accepting it used to leave
+	 * clears, so UNCHANGED is rejected for them: honouring it would leave
 	 * the shadow claiming the compiled-in default (SLEEP_EN set) while the
 	 * device held its reset value, and the first get_data()'s re-arm step
-	 * then wrote that default out -- putting the device to sleep although
+	 * would write that default out -- putting the device to sleep although
 	 * the caller explicitly asked for COMMAND not to be touched. The five
 	 * EEPROM fields DO survive the reset, so UNCHANGED is honoured there
 	 * and the shadow is seeded by reading the device back. */
@@ -846,8 +1061,7 @@ int main(void)
 	 * no automatic return_to_iic, since there's nothing to wake from.
 	 * Sleep is ON in j30d_default_config now (see j30d_config.c -- that's
 	 * what calibration actually runs with), so reaching the sleep-off
-	 * state to test this needs an explicit disable first; it's no longer
-	 * just "whatever a plain j30d_init() already left it as". --- */
+	 * state to test this needs an explicit disable first. --- */
 	{
 		j30d_config_t sleep_off_explicit = {0};
 		sleep_off_explicit.command.status = J30D_FIELD_UPDATED;
@@ -896,6 +1110,30 @@ int main(void)
 	assert(ctx.regs[J30D_REG_COMMAND] & J30D_COMMAND_SLEEP_EN);
 	printf("get_data (sleep on) wakes + re-arms sleep OK\n");
 
+	/* --- a wake must stop the conversion engine before anything is read ---
+	 * A wake leaves MODE_EN set, so the device resumes converting and a
+	 * burst read can straddle a conversion boundary. Stopping the engine
+	 * first freezes the data registers. */
+	{
+		assert(ctx.reads_while_converting == 0);
+
+		int before = ctx.return_to_iic_calls;
+		assert(j30d_get_data(&h, &d) == J30D_OK);
+		assert(ctx.return_to_iic_calls == before + 1);       /* it really woke */
+		assert(ctx.reads_while_converting == 0);             /* and read nothing live */
+		assert(ctx.regs[J30D_REG_COMMAND] & J30D_COMMAND_SLEEP_EN);   /* re-armed */
+		assert(ctx.regs[J30D_REG_COMMAND] & J30D_COMMAND_MODE_EN);    /* MODE_EN back too */
+		printf("wake stops the conversion engine before reading OK\n");
+
+		/* The halt write must clear SLEEP_EN as well. The shadow still
+		 * carries it, and writing it back would put the part straight back
+		 * to sleep -- which the fake models, so the read below would fail. */
+		before = ctx.return_to_iic_calls;
+		assert(j30d_raw_read(&h, 0x50, raw_buf, 2) == J30D_OK);
+		assert(ctx.return_to_iic_calls == before + 1);
+		printf("the halt write clears SLEEP_EN too (device stays awake) OK\n");
+	}
+
 	/* --- turning sleep back off via update_config must stop the auto-wake dance --- */
 	j30d_config_t sleep_off = {0};
 	sleep_off.command.status = J30D_FIELD_UPDATED;
@@ -918,7 +1156,7 @@ int main(void)
 		pace_platform.now_ms = fake_now_ms;
 
 		j30d_handle_t pace_h;
-		assert(j30d_init(&pace_h, &pace_platform, NULL) == J30D_OK);
+		assert(j30d_init(&pace_h, &pace_platform, &suite_cfg) == J30D_OK);
 
 		/* Sleep value 14 -> (14+1)*100 = 1500ms, matching the 1.5s example. */
 		j30d_config_t sleep_1500 = {0};
@@ -985,6 +1223,56 @@ int main(void)
 		assert(j30d_raw_read(&pace_h, 0x50, pace_raw, 1) == J30D_OK);
 		assert(pace_ctx.return_to_iic_calls == pace_recover_before + 1);
 		printf("get_data pacing: j30d_raw_read is never paced, always wakes OK\n");
+	}
+
+	/* --- interrupt-mode pacing is half the sleep interval ---
+	 * The device raises INT again a few ms after every sleep command, so an
+	 * interrupt-driven read must reject that one. It cannot be done at the
+	 * full interval: SLEEP_TIME is untrimmed, so a fast part raises its
+	 * genuine interrupt before the nominal interval has elapsed and would be
+	 * rejected too, halving the sample rate on an in-spec part. */
+	{
+		fake_ctx_t ip_ctx = FAKE_CTX_INIT;
+		j30d_platform_t ip_platform = platform;
+		ip_platform.ctx            = &ip_ctx;
+		ip_platform.now_ms         = fake_now_ms;
+		ip_platform.release_to_int = fake_release_to_int;
+
+		j30d_config_t ip_cfg = suite_cfg;
+		ip_cfg.interrupt_enable = true;
+		ip_cfg.command.status   = J30D_FIELD_UPDATED;
+		ip_cfg.command.value    = j30d_default_config.command.value | J30D_COMMAND_SLEEP_EN;
+		ip_cfg.sleep.status     = J30D_FIELD_UPDATED;
+		ip_cfg.sleep.value      = 14;              /* (14+1)*100 = 1500ms */
+
+		j30d_handle_t ip_h;
+		assert(j30d_init(&ip_h, &ip_platform, &ip_cfg) == J30D_OK);
+
+		set_amb(&ip_ctx, 4096);
+		ip_ctx.virtual_now_ms = 1000;
+
+		j30d_data_t ipd;
+		assert(j30d_get_data(&ip_h, &ipd) == J30D_OK);   /* first call always wakes */
+
+		/* 749ms -- inside half the interval, so still the extra interrupt's
+		 * territory: skip without touching the bus. */
+		ip_ctx.virtual_now_ms = 1000 + 749;
+		int ip_before = ip_ctx.return_to_iic_calls;
+		assert(j30d_get_data(&ip_h, &ipd) == J30D_OK);
+		assert(ip_ctx.return_to_iic_calls == ip_before);
+		assert(ipd.amb.state == J30D_STALE);
+		printf("interrupt-mode pacing: inside half the interval still skips OK\n");
+
+		/* 750ms -- half elapsed. A fast part's genuine interrupt must get
+		 * through here; the full-interval threshold would hold it off to 1500ms. */
+		ip_ctx.virtual_now_ms = 1000 + 750;
+		ip_before = ip_ctx.return_to_iic_calls;
+		set_amb(&ip_ctx, 8192);
+		assert(j30d_get_data(&ip_h, &ipd) == J30D_OK);
+		assert(ip_ctx.return_to_iic_calls == ip_before + 1);
+		assert(ipd.amb.state == J30D_FRESH);
+		assert(ipd.amb.raw_code == 8192);
+		printf("interrupt-mode pacing: half the interval is enough to wake OK\n");
 	}
 
 	printf("ALL TESTS PASSED\n");

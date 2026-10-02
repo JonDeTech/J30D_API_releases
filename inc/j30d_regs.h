@@ -5,12 +5,6 @@
  * customers configure the sensor through j30d_config.h / j30d.h, not by
  * poking these addresses directly, so this header is not included by
  * j30d.h itself (only by j30d.c and j30d_config.c).
- *
- * Prefixed J30D_ (rather than the bare names used in the legacy
- * jirs30d.h) so this can coexist in the same build as the existing driver
- * during the transition without macro collisions.
- *
- * Values carried over unchanged from the existing jirs30d.h register map.
  */
 
 #ifndef J30D_REGS_H_
@@ -110,14 +104,6 @@
 #define J30D_SYS_CFG1_FILT_6         ((uint8_t)(6U << J30D_SYS_CFG1_FILT_COEF_Pos))
 #define J30D_SYS_CFG1_FILT_7         ((uint8_t)(7U << J30D_SYS_CFG1_FILT_COEF_Pos))
 
-/* Names below verified against the NSA3300 datasheet's own register table
- * (0x94), not carried over blind from the legacy driver -- several of the
- * legacy names were wrong in a way that matters. In particular, bits 2 and
- * 4 are NOT power/sleep enables (despite what their old names implied):
- * bit 2 is the polarity of the INT output during Sleep mode, and bits 5:4
- * are a PGA power/noise trade-off setting, not a device power-down bit.
- * Nothing here controls whether the device sleeps -- that's COMMAND's
- * SLEEP_EN (0x30 bit 5) only. */
 #define J30D_REG_SYS_CFG2               0x94
 #define J30D_SYS_CFG2_SWAP_Msk          ((uint8_t)(1U << 0))   /* input_swap: 1 = CH inputs bonded in reverse polarity */
 #define J30D_SYS_CFG2_VT_SCALE_Msk      ((uint8_t)(1U << 1))   /* 0 = +-16mV full range, 1 = +-128mV */
@@ -155,9 +141,21 @@
 #define J30D_BIAS_CFG_DAC_Msk        ((uint8_t)(15U << 0))
 #define J30D_BIAS_CFG_5_16_AVDD      ((uint8_t)(0x0D))
 
-/* Per-channel offset/gain trim registers -- selected at init based on
- * calibration/unit version (see JIRS30D_CHANNEL handling in the legacy
- * driver). */
+/* Sleep-mode INT threshold, 16 bits MSB first, two's complement.
+ * LSB = 1mV * 2^-8, so 0x8000 is -128mV. Compared after every
+ * wake-and-convert in sleep; SYS_CFG2's SLEEP_POL selects which side
+ * triggers. EEPROM-backed; the driver writes it at init only when
+ * interrupt mode is enabled. */
+#define J30D_REG_T_THRESHOLD_SLEEP_MSB 0xAC
+#define J30D_REG_T_THRESHOLD_SLEEP_LSB 0xAD
+
+/* 0x8000 = -128mV, the most negative value the register expresses. At or
+ * below the bottom of the range under either VT_SCALE setting, so every
+ * sample clears it -- which is what makes INT usable as a data-ready
+ * signal. Written only when interrupt mode is enabled. */
+#define J30D_INT_THRESHOLD_MSB         0x80u
+#define J30D_INT_THRESHOLD_LSB         0x00u
+
 #define J30D_REG_CH1_OFF_MSB         0xAE
 #define J30D_REG_CH1_OFF_LSB         0xAF
 #define J30D_REG_CH1_GAIN_MSB        0xB0
@@ -169,8 +167,7 @@
 
 /* Production/calibration data -- a 48-byte block written at factory
  * calibration time, read out once at init and parsed into h->calib (see
- * j30d_calib.h). Offsets are relative to J30D_REG_CUSTOM_MEMORY_START,
- * matching the legacy driver's CUSTOM_MEMORY_* layout exactly. */
+ * j30d_calib.h). Offsets are relative to J30D_REG_CUSTOM_MEMORY_START */
 #define J30D_REG_CUSTOM_MEMORY_START      0xC0
 #define J30D_CUSTOM_MEMORY_SIZE           48    /* 0xC0 to 0xEF inclusive */
 #define J30D_CUSTOM_MEMORY_CRC_LEN        46    /* 0xC0 to 0xED inclusive (excl. CRC bytes) */

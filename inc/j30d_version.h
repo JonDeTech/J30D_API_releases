@@ -29,7 +29,7 @@
 #define J30D_VERSION_H_
 
 #define J30D_API_VERSION_MAJOR   0
-#define J30D_API_VERSION_MINOR   5
+#define J30D_API_VERSION_MINOR   6
 #define J30D_API_VERSION_PATCH   0
 
 #define J30D_API_VERSION \
@@ -52,10 +52,7 @@ extern "C" {
 
 /* Returns the same thing as a static string. No I2C traffic, callable
  * before j30d_init(), and safe to call from any thread -- it hands back a
- * pointer to a const literal and formats nothing at runtime (it used to
- * snprintf() into a shared static buffer, which dragged the whole printf
- * family into the image -- several KB on a Cortex-M0+ -- and raced when two
- * threads called it at once). */
+ * pointer to a const literal and formats nothing at runtime */
 const char *j30d_get_version_string(void);
 
 #ifdef __cplusplus

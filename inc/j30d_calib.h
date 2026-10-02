@@ -11,10 +11,6 @@
  * this block (the legacy driver's write path, used only by factory/CJB
  * calibration tooling, is intentionally not part of this driver).
  *
- * Ported from the legacy jirs30d.c/.h JIRS30D_Calibration_t /
- * detect_unit_version() / ReadProductionData(), bit-for-bit: same byte
- * offsets, same CRC16/CCITT (poly 0x8408, reflected), same Q8.8/S7Q8 fixed
- * point decoding. See j30d.c for the parsing code.
  */
 
 #ifndef J30D_CALIB_H_
@@ -28,9 +24,7 @@ extern "C" {
 #endif
 
 /* How much of the 48-byte calibration block j30d_init() was able to trust,
- * in the order the legacy driver added support for it. Ported unchanged
- * from jirs30d.h's UnitVersion_t (same numeric values) so a UART/log
- * command dumping this doesn't shift meaning across the transition. */
+ * in the order the legacy driver added support for it.  */
 typedef enum
 {
 	J30D_UNIT_VERSION_UNKNOWN          = 0,   /* couldn't tell -- treat calib as absent */
@@ -56,11 +50,7 @@ typedef struct
 	uint16_t  wafer_no;
 
 	/* Offset/gain trim for the heat-flux conversion, one pair per channel.
-	 * Units and the formula they feed depend on `version` -- see
-	 * J30D_Adapter_Convert() in j30d_adapter.c for the version-specific
-	 * math this driver replicates from legacy JIRS30D_Convert(). Only
-	 * channel 1's pair is currently consumed by that adapter (channel 1
-	 * is the fixed signal source, see j30d_adapter.h); channel 2's is
+	 * Units and the formula they feed depend on `version` channel 2's is
 	 * carried here for completeness/future use. */
 #if defined(J30D_NO_FLOAT)
 	/* J30D_NO_FLOAT build (see j30d_types.h): the raw 16-bit trim words

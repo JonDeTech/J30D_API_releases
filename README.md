@@ -1,6 +1,6 @@
 # J30D_API
 
-Firmware driver for the Jondetech **J30D / JIRS30D** heat-flux sensor (NSA3300 ASIC).
+Firmware driver for the Jondetech **J30D / JIRS30D** heat-flux sensor.
 
 Portable C99. No dependencies, no heap, no globals. Everything platform specific —
 I²C, delays, GPIO, RTOS locking — is supplied by the integrator as a handful of
@@ -17,8 +17,9 @@ register beyond the sensor's own.
 - **Platform behind function pointers.** See [`inc/j30d_platform.h`](inc/j30d_platform.h).
   Four hooks are required, three are optional.
 - **Sleep is handled for you.** If sleep is configured, every call that needs the
-  bus wakes the device first and re-commands sleep afterwards. There is no public
-  "wake" function and you never have to ask whether the device is asleep.
+  bus wakes the device, stops the conversion engine so a burst read cannot straddle
+  a conversion, and re-commands sleep afterwards. There is no public "wake"
+  function and you never have to ask whether the device is asleep.
 - **Freshness is per field, not per call.** A read returning `J30D_OK` tells you the
   bus worked; each field separately tells you whether *it* had a new sample.
 - **Values and raw codes both.** Every field carries engineering units and the
@@ -220,10 +221,40 @@ gated on its *own* data-ready bit — even where several fields share one burst 
 In the default single-conversion mode only the converting channel is ever fresh, so
 `ch2` staying `J30D_STALE` is the honest answer, not a fault.
 
+**Interrupt mode makes the bus exclusive.** Setting `config.interrupt_enable` uses the
+device's sleep-mode INT line to signal that a new sample is available. The device has
+no dedicated data-ready interrupt; the driver sets the sleep threshold to its minimum
+(`0xAC/0xAD` = `0x8000`, −128 mV) so that every sample meets the comparator condition,
+and hands SDA to the device on entry to sleep. **While the device sleeps, SDA does not
+belong to the I²C peripheral, so no other device on that bus can be reached — for up
+to 25.6 s at a time.** Do not enable interrupt mode on a shared bus. It also requires both
+`platform.release_to_int` and `platform.now_ms`; `j30d_init()` returns
+`J30D_ERR_PARAM` without either, and likewise if `SLEEP_EN` is not set — INT is the
+sleep-mode comparator output on SDA, so with sleep off the pin is never handed over and
+no interrupt can fire. `now_ms` is not optional here: commanding sleep makes
+the device convert and raise INT again a few ms later, and the pacing is the only thing
+that rejects those — without a clock there is no pacing, and the device never completes
+a sleep interval.
+
+Wire your EXTI handler to call `j30d_notify_interrupt()`, the only function in this
+API that may be called from interrupt context, then signal a task and call
+`j30d_get_data()` from that task. `j30d_get_data()` must not be called from the
+handler: it blocks for tens of milliseconds and, on an RTOS port, sleeps. The flag is
+recorded only and does not change what that read does: the pacing described below
+applies to interrupt-driven reads as well, and is what rejects the extra interrupt the
+device raises a few ms after every sleep command.
+
 **Polling cost.** Supply `platform.now_ms` and `j30d_get_data()` paces itself to the
 device's configured sleep interval: calling it faster cannot make it wake the device
 more often than the sensor could possibly produce a new sample. Without it, every
 call on a sleeping device pays a full wake.
+
+In interrupt mode the threshold is **half** the configured interval instead. The
+pacing has a second job there — rejecting the INT the device raises a few ms after
+every sleep command — and the full interval cannot do both: `SLEEP_TIME` is untrimmed
+(±15% on a 32 kHz oscillator), so a fast part raises its genuine interrupt before the
+nominal interval has elapsed and would be rejected along with the extra one, halving
+the sample rate on a part that is in spec.
 
 **Config model.** Each field in `j30d_config_t` carries its own status, so
 `j30d_update_config()` writes only what changed. `J30D_FIELD_UNCHANGED` means "leave
