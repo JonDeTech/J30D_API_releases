@@ -13,8 +13,9 @@
  * mutual exclusion, which on bare-metal means a critical section
  * (__disable_irq/__enable_irq) wired into lock/unlock, not "no locking".
  *
- * Adjust J30D_BM_I2C_ADDR / J30D_BM_SCL_Pin / J30D_BM_SDA_Pin below for
- * your board if it differs from this EVK.
+ * Adjust the pin macros and J30D_BM_GPIO_CLK_ENABLE() below for your board
+ * if it differs from this EVK. J30D_BM_I2C_ADDR stays the 0x7F wildcard --
+ * see chip_address in j30d_config.h.
  */
 
 #include "platform_stm32_baremetal.h"
@@ -33,14 +34,13 @@
  * afterwards is 0, which compiles the call out -- HAL_Delay(0) still waits
  * a tick. */
 #define J30D_BM_SCL_LOW_MS       15u
-/* 0 means no delay at all -- the call below is compiled out. Do not simply
- * pass 0: vTaskDelay(0) is a yield, and HAL_Delay(0) still waits a tick. */
 #define J30D_BM_SETTLE_MS        0u
 
 #define J30D_BM_SCL_Pin        I2C_SCL_Pin
 #define J30D_BM_SCL_GPIO_Port  I2C_SCL_GPIO_Port
 #define J30D_BM_SDA_Pin        I2C_SDA_Pin
 #define J30D_BM_SDA_GPIO_Port  I2C_SDA_GPIO_Port
+#define J30D_BM_GPIO_CLK_ENABLE()  __HAL_RCC_GPIOB_CLK_ENABLE()   /* the port SCL and SDA are on */
 
 /* Everything this port needs, reachable from `ctx`. A bare-metal build
  * with a single J30D sensor can just point ctx at &hi2c1 directly and drop
@@ -121,7 +121,7 @@ static void bm_return_to_iic(void *ctx)
 	HAL_I2C_MspDeInit(c->hi2c);
 
 	GPIO_InitTypeDef gpio_init = {0};
-	__HAL_RCC_GPIOB_CLK_ENABLE();
+	J30D_BM_GPIO_CLK_ENABLE();
 
 	/* SDA becomes an input (device drives it during the wake handshake) */
 	gpio_init.Pin  = J30D_BM_SDA_Pin;

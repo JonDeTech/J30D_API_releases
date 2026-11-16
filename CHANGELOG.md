@@ -7,6 +7,37 @@ explicitly below.
 
 Dates are release dates. Releases before 0.5.0 were not tagged.
 
+## 0.7.0 — 2026-11-16
+
+### Added
+
+- **`J30D_ERR_RESTARTED`, and a check for stopped conversions.** An I²C transfer that holds SCL low for about 10 ms sends the device its return-to-IIC signal. On a device that is converting, that clears `COMMAND`, so conversions stop and the data stops changing. In sleep mode every call rewrites `COMMAND` anyway. Converting continuously, nothing did, and the device stayed stopped. Now, when `j30d_get_data()` finds no new data for two conversion times (on every such call without `now_ms`), it reads `COMMAND` back. If conversions had stopped, it writes `COMMAND` again and returns `J30D_ERR_RESTARTED`. `j30d_get_data_blocking()` passes that code on.
+- **`j30d_heat_flux()` and `j30d_heat_flux_x1000()`** — apply the unit's factory calibration to a `raw_ch1` sample: mW/cm² as a `float`, or mW/cm² × 1000 as an `int32_t` (12345 = 12.345 mW/cm²), the latter also in `J30D_NO_FLOAT` builds. Pure arithmetic with no bus access; pair them with `j30d_get_data_blocking()`. The formula follows the unit generation: `gain1 · raw_ch1[mV] + offset1` for REV1/REV2+, `gain1 · 1e‑5 · raw_ch1[code] − offset1` for CH1_NOTIMESTAMP.
+- **`J30D_ERR_NO_CALIB`** — returned by the heat-flux functions for a unit with no usable calibration (CH2, UNKNOWN, or a block that could not be read).
+- **`J30D_SLEEP_TIME_MS(ms)`** — the `SLEEP_TIME` register value for an interval in milliseconds, so `J30D_SLEEP_TIME_MS(1500)` instead of `0x0E`. A value that is not a multiple of 100 ms between 100 ms and 25.6 s fails to compile.
+- **`J30D_SET(v)` and `J30D_SET_INIT(v)`** — set a config field's value and `J30D_FIELD_UPDATED` together, for an assignment and for an initializer. A `.value` written without its status is silently ignored; these make that mistake impossible.
+- **`j30d_get_sample_interval_ms()`** — the polling period at which every `j30d_get_data()` call returns new data: 1796 ms at the defaults, where `SLEEP_TIME` is 1500 ms.
+- **`j30d_get_data_blocking(h, out, timeout_ms)`** — waits for the next sample; `J30D_OK` means `raw_ch1` is `J30D_FRESH`. It goes through the same pacing as `j30d_get_data()`, so every sample comes from the conversion that ends a full sleep interval. Returns as soon as the INT is recorded in interrupt mode, after the worst-case sample time in polling. Requires `platform.now_ms`.
+
+### Changed
+
+- The data fields now state their units: `amb` in °C, `ch1`/`ch2` and `raw_ch1`/`raw_ch2` in mV. The STM32 port headers carry complete heat-flux examples.
+- **The config field values are public.** `J30D_COMMAND_*`, `J30D_SYS_CFG1_*`, `J30D_SYS_CFG2_*`, `J30D_SYS_CHx_CFG_*` and `J30D_BIAS_CFG_*` moved from `j30d_regs.h`, which `j30d.h` does not include, to `j30d_config.h`, which it does — so `j30d_update_config()` at runtime no longer needs an internal header or magic numbers. `j30d_regs.h` includes `j30d_config.h`, so code that included it still compiles.
+- **In interrupt mode, `j30d_get_data()` reads early only with an INT pending.** The shorter interrupt-mode wait used to apply to every call, so a call made without an INT — from a timer, or after a lost interrupt — could wake the device before the sample was complete and return the conversion done on entry to sleep. Without a pending INT the full polling wait now applies, and `j30d_notify_interrupt()` is what enables the shorter one.
+- **`j30d_update_config()` ignores `interrupt_enable`.** Interrupt mode is chosen at `j30d_init()`. A zero-initialised config passed to `j30d_update_config()` used to switch interrupt mode off silently; it now changes only the fields it marks.
+
+### Fixed
+
+- **The FreeRTOS port could stall SCL.** Its polled HAL transfers hold SCL low while the task is not running, so a task preempted mid-transfer for about 10 ms stopped a converting device. Each transfer now runs with the scheduler suspended; interrupts stay enabled. `j30d_platform.h` states the requirement for every port: `i2c_read`/`i2c_write` must never pause with SCL held low for milliseconds.
+- **`ch1`/`ch2` ignored `VT_SCALE`.** Their `.value` was always the CAL code divided by 2^19, which is right for `SYS_CFG2`'s `VT_SCALE` clear (±16 mV full scale) but reads 1/8 of the true voltage with it set (±128 mV). The scale now follows the bit; `J30D_VTP_SCALE_WIDE` / `J30D_VTP_SCALE_WIDE_SHIFT` (2^16) give the wide-range relationship for `J30D_NO_FLOAT` builds. The README and header examples now read `raw_ch1`, the input the factory heat-flux calibration applies to, instead of `ch1`.
+- **Polling a sleeping device could return no new data at all.** Every read ends in a sleep command, which restarts the device's cycle — convert, sleep `SLEEP_TIME`, convert — and a wake before that second conversion completes halts it. `j30d_get_data()` paced from its own wake and counted only `SLEEP_TIME`, so polling slightly slower than `SLEEP_TIME` with `now_ms` (or at any rate below the true sample period without it) could restart the cycle on every call, and a timer at exactly `SLEEP_TIME` got every second call paced out. Pacing now counts from the last sleep command, whichever call issued it, and waits for the sleep interval and the conversions around it at their longest (oscillator ±15%). Conversion time is `(OSRP + 2 × OSRT + 1481) / Fosc_kHz` ms. The first `j30d_get_data()` after `j30d_init()`, `j30d_update_config()` or a raw call now returns stale data until that sample is complete, rather than waking early.
+- **Re-initialising a handle is serialized.** `j30d_init()` takes the platform lock before clearing the handle, and a lock that cannot be acquired leaves the handle as it was.
+- **`j30d_init()` checks the config it actually applies.** With `config == NULL`, the rules for `command`/`sleep` and interrupt mode now apply to `j30d_default_config`, and its `UNCHANGED` fields are read back from the device. A `DEFAULT` `command` is checked by its default value.
+- **`chip_address` in `h->config` reflects the device** when left `UNCHANGED`, and after a `j30d_raw_write()` to `0x92`.
+- **`j30d_update_config()` writes COMMAND once.** It no longer re-commands a device it has just put to sleep.
+- **FreeRTOS port:** `configTICK_RATE_HZ` must divide 1000 (compile-time check); minimum delays are rounded up to whole ticks; a mutex that cannot be allocated reports `J30D_ERR_TIMEOUT` instead of faulting.
+- **Zephyr sketch:** the return-to-IIC sequence holds SCL low through `scl-gpios`; `i2c_recover_bus()` does not perform it.
+
 ## 0.6.0 — 2026-10-02
 
 - **Interrupt mode** (`config.interrupt_enable`): the sleep-mode INT line on SDA as a data-ready signal. Requires `platform.release_to_int`, `platform.now_ms` and `SLEEP_EN`, and makes the I²C bus exclusive to this device while it sleeps.

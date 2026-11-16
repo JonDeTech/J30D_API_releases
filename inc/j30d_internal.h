@@ -7,11 +7,8 @@
  * which means every member it contains needs a compile-time-known size.
  *
  * NOTHING in this file is part of the supported API. Field names and layout
- * here can change in any release, including a PATCH one. That is safe ONLY
- * because this driver ships as source and is always recompiled with its own
- * headers -- a change here does resize j30d_handle_t, so it is a hard break
- * for anyone linking a pre-built object against different headers. There is
- * no ABI guarantee; see the note on j30d_handle_t in j30d.h.
+ * here can change in any release, including a PATCH one -- see the note on
+ * binary compatibility at j30d_handle_t in j30d.h.
  *
  * Do not read or write these members from application code -- go through
  * the j30d_* functions declared in j30d.h (j30d_get_calib() /
@@ -31,27 +28,28 @@ extern "C" {
 
 typedef struct
 {
-	j30d_data_t   last_data;        /* last known-good value per field, including stale ones */
-	uint8_t       status_reg_raw;   /* last DATA_READY read */
-	uint8_t       status_raw_reg_raw; /* last DATA_READY_RAW read */
+	j30d_data_t   last_data;            /* last known-good value per field, including stale ones */
+	uint8_t       status_reg_raw;       /* last DATA_READY read */
+	uint8_t       status_raw_reg_raw;   /* last DATA_READY_RAW read */
 
-	/* j30d_get_data()'s sleep-interval pacing (only consulted/updated when
-	 * platform.now_ms is non-NULL and sleep is configured -- see
-	 * should_skip_wake() in j30d.c). last_get_data_wake_ms is meaningless
-	 * until get_data_has_woken is true -- needed because 0 is itself a
-	 * valid now_ms() reading (e.g. very shortly after boot), so it can't
-	 * double as "never woken yet". */
-	uint32_t      last_get_data_wake_ms;
-	bool          get_data_has_woken;
+	/* now_ms() at the last sleep command, which restarts the device's
+	 * conversion cycle; j30d_get_data()'s pacing counts from it -- see the
+	 * sample-timing section in j30d.c. sleep_command_ms means nothing until
+	 * sleep_commanded is true, since 0 is itself a valid now_ms() reading. */
+	uint32_t      sleep_command_ms;
+	bool          sleep_commanded;
 
-	/* Set by j30d_notify_interrupt() from interrupt context, consumed by the
-	 * next j30d_get_data(). volatile because the two run in different
-	 * contexts; a single bool store needs no locking.
-	 *
-	 * Bypasses the pacing above: samples arrive one sleep interval plus one
-	 * conversion apart, so pacing on the interval alone rejects ready
-	 * reads. */
+	/* Set by j30d_notify_interrupt() from interrupt context, cleared by
+	 * each j30d_get_data(). In interrupt mode it lets the pacing above use
+	 * its shorter wait. volatile because the two run in different contexts;
+	 * a single bool store needs no locking. */
 	volatile bool interrupt_pending;
+
+	/* Converting continuously: now_ms() when conversions were last known
+	 * to be running, for j30d_get_data()'s stopped-conversion check -- see
+	 * j30d.c. converting_ms means nothing until converting_seen is true. */
+	uint32_t      converting_ms;
+	bool          converting_seen;
 } j30d_internal_t;
 
 #ifdef __cplusplus

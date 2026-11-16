@@ -25,11 +25,23 @@
 extern "C" {
 #endif
 
-/* Read `len` bytes starting at device register `reg` into `buf`.
- * Return J30D_OK on success, J30D_ERR_I2C/J30D_ERR_TIMEOUT on failure. */
+/* Read `len` bytes starting at device register `reg` into `buf`: the
+ * register byte, then a repeated START and the read, as one transaction.
+ * Return J30D_OK on success, J30D_ERR_I2C/J30D_ERR_TIMEOUT on failure.
+ *
+ * A transaction must never pause with SCL held low for milliseconds. SCL low
+ * for about 10 ms -- the exact threshold varies from unit to unit, and can
+ * be below 10 ms -- is the device's return-to-IIC signal (see return_to_iic
+ * below), and on a device that is converting it clears COMMAND and stops
+ * the conversions. A master holds SCL low whenever its software is late:
+ * between the register byte and the repeated START, or between bytes. So a
+ * polled transfer must not be preempted part-way, and an interrupt-driven
+ * one must not be starved by higher-priority work. Keep any such pause well
+ * under 8 ms; in microseconds is best. */
 typedef j30d_err_t (*j30d_i2c_read_fn)(void *ctx, uint8_t reg, uint8_t *buf, size_t len);
 
-/* Write `len` bytes from `buf` starting at device register `reg`. */
+/* Write `len` bytes from `buf` starting at device register `reg`. The same
+ * rule as for i2c_read applies: no long pause with SCL held low. */
 typedef j30d_err_t (*j30d_i2c_write_fn)(void *ctx, uint8_t reg, const uint8_t *buf, size_t len);
 
 /* Blocking delay in milliseconds. Required -- the reset/wake handshakes
@@ -48,9 +60,10 @@ typedef void (*j30d_delay_ms_fn)(void *ctx, uint32_t ms);
  * J30D_REG_SYS_CFG1). Same one sequence serves both cases. Entirely
  * platform specific:
  *   - STM32 HAL:  HAL_I2C_MspDeInit() + direct GPIO toggling + HAL_I2C_MspInit()
- *   - Zephyr:      i2c_recover_bus(), falling back to gpio_dt toggling +
- *                  i2c_configure() if the controller driver has no recovery support
- *   - bare-metal:  direct peripheral/GPIO register pokes
+ *   - Zephyr:     gpio_dt toggling of SCL + i2c_configure(). Not
+ *                 i2c_recover_bus(): that clocks SCL to free a stuck target
+ *                 and never holds it low for 10ms.
+ *   - bare-metal: direct peripheral/GPIO register pokes
  *
  * This seizes the *entire* physical bus, not just this device's slice of
  * it -- it must only be called while the bus lock (below) is held, and if
@@ -73,14 +86,18 @@ typedef void (*j30d_return_to_iic_fn)(void *ctx);
  * Leave both NULL on a single-threaded bare-metal build where only one
  * execution context ever calls into this handle -- the driver then
  * performs no locking at all, which is the correct (and only sane)
- * choice in that case. */
-/* lock returns true if the lock was actually acquired, false if it was not
+ * choice in that case.
+ *
+ * lock returns true if the lock was actually acquired, false if it was not
  * (a mutex take that timed out, say). On false the driver aborts the call
  * with J30D_ERR_TIMEOUT WITHOUT touching the bus and WITHOUT calling unlock
  * -- so a lock implementation that gives up must report it rather than
  * letting the caller through, which would silently void the mutual
  * exclusion this hook exists to provide. An implementation that blocks
  * forever, or one that cannot fail, simply always returns true. */
+typedef bool (*j30d_lock_fn)(void *ctx);
+typedef void (*j30d_unlock_fn)(void *ctx);
+
 /* Hand SDA to the device as its INT output and enable the pin interrupt.
  * Optional; called only in interrupt mode, once the sleep command has been
  * written. return_to_iic() reclaims the pins.
@@ -92,37 +109,34 @@ typedef void (*j30d_return_to_iic_fn)(void *ctx);
  * sleeps, SDA is not an I2C pin. Do not use on a shared bus. */
 typedef void (*j30d_release_to_int_fn)(void *ctx);
 
-typedef bool (*j30d_lock_fn)(void *ctx);
-typedef void (*j30d_unlock_fn)(void *ctx);
-
 /* Optional. A free-running millisecond timestamp (HAL_GetTick(),
  * xTaskGetTickCount(), k_uptime_get_32(), ...) -- doesn't need to mean
  * anything except "time elapsed since some fixed point", and wraparound is
  * handled correctly (unsigned subtraction) as long as no single interval
  * being measured exceeds ~24 days, which sleep intervals never do.
  *
- * Only used to pace j30d_get_data() while sleep is configured: without it,
+ * Only used to pace j30d_get_data() while sleep is configured. Without it,
  * every j30d_get_data() call on a sleeping device pays a full wake
- * (return_to_iic(), tens of ms) even if called far more often than the
- * device's own sleep interval could possibly produce new data -- see the
- * comment on sleep_is_configured()/ensure_awake() in j30d.c. Leave NULL to
- * keep that always-wake behavior (e.g. if your platform has no cheap tick
- * source, or you're calling j30d_get_data() at a rate you already control
- * yourself). j30d_raw_read()/j30d_raw_write() never consult this -- they
- * always perform the access you asked for. */
+ * (return_to_iic(), tens of ms), and a call that comes before the next
+ * sample is complete halts its conversion and restarts the device's cycle
+ * -- so polling faster than j30d_get_sample_interval_ms() can return no new
+ * data at all. Leave NULL only if your platform has no cheap tick source
+ * and you call j30d_get_data() at least that far apart yourself.
+ * j30d_raw_read()/j30d_raw_write() never consult this -- they always
+ * perform the access you asked for. */
 typedef uint32_t (*j30d_now_ms_fn)(void *ctx);
 
 typedef struct
 {
-	j30d_i2c_read_fn     i2c_read;      /* required */
-	j30d_i2c_write_fn    i2c_write;     /* required */
-	j30d_delay_ms_fn     delay_ms;      /* required */
-	j30d_return_to_iic_fn return_to_iic; /* required */
-	j30d_lock_fn         lock;          /* optional -- see above */
-	j30d_unlock_fn       unlock;        /* optional -- see above */
-	j30d_now_ms_fn       now_ms;        /* optional -- see above */
-	j30d_release_to_int_fn release_to_int; /* optional -- required for interrupt mode */
-	void                 *ctx;          /* passed back to every callback above */
+	j30d_i2c_read_fn        i2c_read;         /* required */
+	j30d_i2c_write_fn       i2c_write;        /* required */
+	j30d_delay_ms_fn        delay_ms;         /* required */
+	j30d_return_to_iic_fn   return_to_iic;    /* required */
+	j30d_lock_fn            lock;             /* optional -- see above */
+	j30d_unlock_fn          unlock;           /* optional -- see above */
+	j30d_now_ms_fn          now_ms;           /* optional -- required for interrupt mode */
+	j30d_release_to_int_fn  release_to_int;   /* optional -- required for interrupt mode */
+	void                   *ctx;              /* passed back to every callback above */
 } j30d_platform_t;
 
 #ifdef __cplusplus

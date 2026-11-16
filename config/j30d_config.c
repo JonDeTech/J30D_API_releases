@@ -7,8 +7,7 @@
  * is left alone entirely and never reads this table.)
  */
 
-#include "j30d_config.h"
-#include "j30d_regs.h"   /* for the bit-value macros used below */
+#include "j30d_config.h"   /* the field types, and the values used below */
 
 const j30d_config_t j30d_default_config = {
 
@@ -19,6 +18,7 @@ const j30d_config_t j30d_default_config = {
 	 *     .value  = 0x10,                  <- your 7-bit address
 	 *     .status = J30D_FIELD_UPDATED,    <- without this, .value is ignored
 	 *
+	 * or, in one go, replace the whole initializer with J30D_SET_INIT(0x10).
 	 * It is then written at every j30d_init(), like every other field here.
 	 * Nothing is stored in EEPROM, so nothing can be corrupted. */
 	.chip_address = {
@@ -34,8 +34,10 @@ const j30d_config_t j30d_default_config = {
 		.status = J30D_FIELD_DEFAULT,
 	},
 
+	/* The factory calibration assumes 1500 ms -- see J30D_SLEEP_TIME_MS in
+	 * j30d_config.h before changing it. */
 	.sleep = {
-		.value  = 0x0E,   /* 1500 ms */
+		.value  = J30D_SLEEP_TIME_MS(1500),
 		.status = J30D_FIELD_DEFAULT,
 	},
 
@@ -64,8 +66,9 @@ const j30d_config_t j30d_default_config = {
 		.status = J30D_FIELD_DEFAULT,
 	},
 
-	/* Off. Turning it on also requires platform.release_to_int, and makes the
-	 * I2C bus exclusive to this device -- see j30d_config.h. */
+	/* Off. Turning it on also requires platform.release_to_int and
+	 * platform.now_ms, and makes the I2C bus exclusive to this device -- see
+	 * j30d_config.h. */
 	.interrupt_enable = false,
 
 	.bias_cfg = {

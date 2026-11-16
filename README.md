@@ -59,9 +59,9 @@ if (j30d_init(&h, &platform, NULL) != J30D_OK) { /* handle it */ }   /* NULL == 
 
 j30d_data_t d;
 if (j30d_get_data(&h, &d) == J30D_OK) {
-    if (d.ch1.state == J30D_FRESH) {
-        use(d.ch1.value);      /* engineering units */
-        log(d.ch1.raw_code);   /* the unscaled ADC code it came from */
+    if (d.raw_ch1.state == J30D_FRESH) {
+        use(d.raw_ch1.value);      /* mV at the PGA input -- what heat flux is computed from */
+        log(d.raw_ch1.raw_code);   /* the unscaled ADC code it came from */
     }
     /* fields that were not ready are J30D_STALE and still hold their
        last known-good value -- they are never left undefined */
@@ -69,6 +69,34 @@ if (j30d_get_data(&h, &d) == J30D_OK) {
 ```
 
 That is the whole hot path. `j30d_get_data()` refreshes all six fields in one call.
+
+**3. Configure.** `j30d_init(&h, &platform, NULL)` applies the defaults in
+[`config/j30d_config.c`](config/j30d_config.c). To start from them with changes, copy
+them and set fields. `J30D_SET()` sets a field's value and marks it to be written in
+one go; the values themselves (gain, OSR, clock, mode, ...) are in
+[`inc/j30d_config.h`](inc/j30d_config.h), which `j30d.h` includes.
+
+```c
+j30d_config_t cfg = j30d_default_config;
+cfg.ch1_cfg = J30D_SET(J30D_SYS_CHx_CFG_OSRP_8192 | J30D_SYS_CHx_CFG_GAIN_32);
+cfg.sleep   = J30D_SET(J30D_SLEEP_TIME_MS(1500));   /* 100 ms steps, 100 ms .. 25.6 s */
+if (j30d_init(&h, &platform, &cfg) != J30D_OK) { /* handle it */ }
+```
+
+Later, change one setting and leave the rest alone — a zeroed `j30d_config_t` has
+every field `J30D_FIELD_UNCHANGED`:
+
+```c
+j30d_config_t upd = {0};
+upd.ch1_cfg = J30D_SET(J30D_SYS_CHx_CFG_OSRP_8192 | J30D_SYS_CHx_CFG_GAIN_64);
+j30d_update_config(&h, &upd);
+```
+
+`J30D_SLEEP_TIME_MS()` refuses at compile time anything that is not a multiple of
+100 ms between 100 ms and 25.6 s. The factory calibration assumes the default
+1500 ms: another interval changes the ASIC's self-heating and introduces an offset.
+In a static table such as `j30d_default_config`, use `J30D_SET_INIT()` instead of
+`J30D_SET()`.
 
 ## Layout
 
@@ -83,7 +111,9 @@ That is the whole hot path. `j30d_get_data()` refreshes all six fields in one ca
 
 **About `ports/`:** these `#include` *your* project's headers (`main.h`, `i2c.h`, the
 vendor HAL, FreeRTOS), so they do not compile standalone in this repository. Treat
-them as reference implementations to copy into your tree and adjust.
+them as reference implementations to copy into your tree and adjust. The FreeRTOS port
+needs `configTICK_RATE_HZ` to divide 1000 (1000, 500, 200, 100 Hz, ...) and refuses to
+compile otherwise.
 `ports/platform_zephyr_mockup.c` is explicitly an uncompiled sketch showing the shape
 a Zephyr port would take — it is not a working port and the build will not accept it.
 
@@ -231,49 +261,107 @@ to 25.6 s at a time.** Do not enable interrupt mode on a shared bus. It also req
 `J30D_ERR_PARAM` without either, and likewise if `SLEEP_EN` is not set — INT is the
 sleep-mode comparator output on SDA, so with sleep off the pin is never handed over and
 no interrupt can fire. `now_ms` is not optional here: commanding sleep makes
-the device convert and raise INT again a few ms later, and the pacing is the only thing
+the device convert and raise INT one conversion later, and the pacing is the only thing
 that rejects those — without a clock there is no pacing, and the device never completes
 a sleep interval.
 
+Interrupt mode is chosen at `j30d_init()`; `j30d_update_config()` ignores
+`interrupt_enable`. Clearing `SLEEP_EN` with `j30d_update_config()` pauses it, since an
+awake device raises no INT, and setting `SLEEP_EN` again resumes it.
+
 Wire your EXTI handler to call `j30d_notify_interrupt()`, the only function in this
 API that may be called from interrupt context, then signal a task and call
-`j30d_get_data()` from that task. `j30d_get_data()` must not be called from the
-handler: it blocks for tens of milliseconds and, on an RTOS port, sleeps. The flag is
-recorded only and does not change what that read does: the pacing described below
-applies to interrupt-driven reads as well, and is what rejects the extra interrupt the
-device raises a few ms after every sleep command.
+`j30d_get_data()` (or `j30d_get_data_blocking()`) from that task. Neither may be called
+from the handler: they block for tens of milliseconds and, on an RTOS port, sleep. The
+pacing described below applies to interrupt-driven reads as well, and is what rejects
+the extra interrupt the device raises one conversion after every sleep command —
+answer every INT promptly, so that one is consumed while it is still recognisable.
 
-**Polling cost.** Supply `platform.now_ms` and `j30d_get_data()` paces itself to the
-device's configured sleep interval: calling it faster cannot make it wake the device
-more often than the sensor could possibly produce a new sample. Without it, every
-call on a sleeping device pays a full wake.
+**Sample timing.** With sleep on, `SLEEP_TIME` is the gap between conversions, not the
+sample period. Every read wakes the device and ends by commanding sleep again, which
+restarts its cycle: it converts, sleeps for `SLEEP_TIME`, then converts again. A wake
+before that second conversion is complete halts it, and the cycle starts over — so a
+host that keeps waking the device too early never sees a sample at all. Conversion
+time is `(OSRP + 2 × OSRT + 1481) / Fosc_kHz` ms, about 9 ms at the defaults.
 
-In interrupt mode the threshold is **half** the configured interval instead. The
-pacing has a second job there — rejecting the INT the device raises a few ms after
-every sleep command — and the full interval cannot do both: `SLEEP_TIME` is untrimmed
-(±15% on a 32 kHz oscillator), so a fast part raises its genuine interrupt before the
-nominal interval has elapsed and would be rejected along with the extra one, halving
-the sample rate on a part that is in spec.
+Supply `platform.now_ms` and `j30d_get_data()` counts from the last sleep command and
+does not wake the device until that sample is complete on any part in spec (`SLEEP_TIME`
+is untrimmed, ±15% on a 32 kHz oscillator); earlier calls return the last data, marked
+stale, without touching the bus. To poll on a timer, use a period of at least
+`j30d_get_sample_interval_ms()` — 1796 ms at the defaults, not 1500 — and every call
+returns new data. Without `now_ms`, calls closer together than that can return no new
+data at all.
+
+In interrupt mode an INT marks the sample, so with one pending the pacing only has to
+reject the INT raised by the conversion on entry to sleep: it waits for that conversion
+plus half the shortest possible sleep interval, which separates the two at every
+`SLEEP_TIME`. With no INT pending — a timer-driven call, or a lost interrupt — the full
+polling wait applies, so a read never lands before the sample is complete.
+
+**Blocking read.** `j30d_get_data_blocking(&h, &d, timeout_ms)` waits for the next
+sample and returns `J30D_OK` only when `d.raw_ch1` is `J30D_FRESH`. It is
+`j30d_get_data()` called at the right moments, so it never wakes the device sooner and
+never returns a conversion taken while the device was awake. In polling it returns
+after the worst-case sample time; in interrupt mode, as soon as the INT is recorded.
+It waits in `platform.delay_ms()` with the handle unlocked, needs `platform.now_ms`,
+and returns `J30D_ERR_TIMEOUT` if nothing new arrives in time.
+
+**Never stall SCL.** Holding SCL low for about 10 ms is the device's return-to-IIC
+signal, the same one that wakes it from sleep. On a device that is awake and converting
+it clears `COMMAND`, so conversions stop and the data stops changing. The threshold
+varies from unit to unit and can be below 10 ms. A master holds SCL low whenever its
+software is late in the middle of a transfer, for instance a task preempted between the
+register byte and the read. Your `i2c_read`/`i2c_write` must therefore never pause for
+milliseconds: keep each transfer free of preemption or starvation. The FreeRTOS port
+suspends the scheduler around each HAL transfer for this reason. Converting
+continuously (sleep off), `j30d_get_data()` also checks for it. If no new data has come
+for two conversion times, it reads `COMMAND` back. If conversions had stopped, it
+restarts them and returns `J30D_ERR_RESTARTED`, which tells you a transfer on your bus
+stalled.
 
 **Config model.** Each field in `j30d_config_t` carries its own status, so
 `j30d_update_config()` writes only what changed. `J30D_FIELD_UNCHANGED` means "leave
 the device alone", `J30D_FIELD_DEFAULT` means "use the compiled-in default",
 `J30D_FIELD_UPDATED` means "write my value". At `j30d_init()`, `command` and `sleep`
 may **not** be `UNCHANGED` — `init` soft-resets the device, which returns those RAM
-registers to their reset values, so there is nothing left to preserve; pass `NULL`
-for defaults or state what you want. `h->config` always reflects what the device
-actually holds, so the read-modify-write idiom is safe:
+registers to their reset values, so there is nothing left to preserve. That holds for
+`j30d_default_config` too when you pass `NULL`. `h->config` always reflects what the
+device actually holds, so the read-modify-write idiom is safe:
 
 ```c
 j30d_config_t cfg = *j30d_get_config(&h);
-cfg.sleep.status = J30D_FIELD_UPDATED;
-cfg.sleep.value  = 0x0E;                  /* (0x0E + 1) * 100ms = 1500ms */
+cfg.sleep = J30D_SET(J30D_SLEEP_TIME_MS(1500));
 j30d_update_config(&h, &cfg);
 ```
 
 **`raw_amb` is not in millivolts.** The ambient sensor bypasses the analog front end,
 so it has no PGA gain and no millivolt equivalent — `raw_amb.value` is the unscaled
 code. `raw_ch1`/`raw_ch2` do run through the PGA and are genuine millivolts.
+
+**`ch1`/`ch2` are not the heat-flux input.** They are the ASIC's corrected thermopile
+voltage from its CAL registers, in millivolts, scaled by `SYS_CFG2`'s `VT_SCALE`
+(±16 mV full scale when clear, ±128 mV when set). The factory heat-flux calibration
+in `h->calib` applies to `raw_ch1`.
+
+**Heat flux.** `j30d_heat_flux()` applies the unit's factory calibration to a `raw_ch1`
+sample and gives mW/cm² as a `float`; `j30d_heat_flux_x1000()` gives the same as an
+`int32_t` in mW/cm² × 1000 (12345 = 12.345 mW/cm²), and is the one available in
+`J30D_NO_FLOAT` builds. Both are pure arithmetic — read the sample first, ideally with
+`j30d_get_data_blocking()`, whose `J30D_OK` means it is fresh:
+
+```c
+j30d_data_t d;
+float       hf;
+if (j30d_get_data_blocking(&h, &d, 5000) == J30D_OK &&
+    j30d_heat_flux(&h, &d.raw_ch1, &hf) == J30D_OK) {
+    use(hf);   /* mW/cm2 */
+}
+```
+
+Units with no usable calibration (the earliest CH2 units, or a block that failed its
+check) return `J30D_ERR_NO_CALIB`. The formula depends on the unit generation; both are
+in `j30d.h`. The calibration assumes the default 1500 ms `SLEEP_TIME`. The STM32 ports'
+headers have complete examples.
 
 **Locking.** `platform.lock` returns `bool`. If it reports failure, the call is
 abandoned with `J30D_ERR_TIMEOUT` before any bus access and `unlock` is not called —

@@ -11,30 +11,17 @@
  *  - All platform/OS/I2C specifics are supplied via j30d_platform_t
  *    function pointers (see j30d_platform.h) -- this file and j30d.c have
  *    no dependency on any vendor HAL, RTOS, or GPIO register.
- *  - Optional platform.lock/unlock hooks let the driver serialize calls on
- *    the SAME handle across threads (FreeRTOS mutex, Zephyr k_mutex, or a
- *    critical section). On a single-threaded bare-metal build, leave them
- *    NULL and no locking happens at all. If lock reports failure (it
- *    returns bool -- see j30d_platform.h), the call is abandoned with
- *    J30D_ERR_TIMEOUT before any bus access rather than proceeding
- *    unserialized, so every j30d_* function below can return
- *    J30D_ERR_TIMEOUT for that reason alone. True parallel I2C transactions
- *    are never possible (single physical bus) -- the guarantee locking
- *    provides is "callers block and don't corrupt state", not "run at the
- *    same time".
- *  - Sleep is handled for you. If sleep ends up enabled in h->config
- *    (whether via j30d_init()'s config or a later j30d_update_config()),
- *    every call below that needs the bus wakes the device, stops the
- *    conversion engine so a burst read cannot straddle a conversion, and
- *    re-commands sleep afterward, automatically. There is no public
- *    "wake" call and none of the functions below need you to think about
- *    whether the device happens to be asleep right now.
- *  - If you also give platform.now_ms, j30d_get_data() paces itself to the
- *    device's own configured sleep interval -- calling it faster than that
- *    (from a fast poll loop, multiple threads, whatever) will not wake the
- *    device or touch the bus more often than the interval allows; you just
- *    get the same last known-good data back, marked stale, on the calls
- *    that land too soon. See j30d_get_data()'s doc comment below.
+ *  - Optional platform.lock/unlock hooks serialize calls on the SAME handle
+ *    across threads (FreeRTOS mutex, Zephyr k_mutex, or a critical section);
+ *    leave them NULL on a single-threaded build. A lock that reports failure
+ *    abandons the call with J30D_ERR_TIMEOUT before any bus access, so every
+ *    j30d_* function below can return J30D_ERR_TIMEOUT for that reason alone.
+ *  - Sleep is handled for you. If sleep is configured, every call below that
+ *    needs the bus wakes the device, stops the conversion engine so a burst
+ *    read cannot straddle a conversion, and re-commands sleep afterwards.
+ *  - Given platform.now_ms, j30d_get_data() paces itself to the device's
+ *    sample timing -- see its doc comment and
+ *    j30d_get_sample_interval_ms() below.
  *
  * Usage sketch:
  *
@@ -46,7 +33,7 @@
  *
  *   j30d_data_t data;
  *   if (j30d_get_data(&h, &data) == J30D_OK) {
- *       if (data.ch1.state == J30D_FRESH) { ... }
+ *       if (data.raw_ch1.state == J30D_FRESH) { ... }   -- the heat-flux input, mV
  *   }
  */
 
@@ -71,11 +58,7 @@ typedef struct
 {
 	j30d_platform_t   platform;      /* copied in at j30d_init() */
 	j30d_config_t     config;        /* shadow of what's currently applied on the device */
-	j30d_calib_t      calib;         /* factory calibration/production data, read once at init -- see j30d_calib.h.
-	                                   * Best-effort: a read/parse failure leaves calib.valid == false and
-	                                   * calib.version == J30D_UNIT_VERSION_UNKNOWN rather than failing
-	                                   * j30d_init() outright -- units without calibration data are expected
-	                                   * to exist (see j30d_unit_version_t). */
+	j30d_calib_t      calib;         /* factory calibration, read best-effort at init -- see j30d_calib.h */
 	j30d_internal_t   internal;      /* driver-private -- do not read/write directly */
 	bool              initialized;
 } j30d_handle_t;
@@ -90,39 +73,45 @@ typedef struct
  * contract, not an ABI. */
 
 /*
- * Resets the device, applies `config` (or j30d_default_config if `config`
- * is NULL), and waits for the EEPROM-loaded handshake (polling
- * J30D_REG_ERROR_CODE, see j30d_types.h's J30D_ERR_EEPROM_NOT_LOADED).
+ * Resets the device, waits for the EEPROM-loaded handshake (polling
+ * J30D_REG_ERROR_CODE; J30D_ERR_EEPROM_NOT_LOADED if it never completes),
+ * and applies `config`, or j30d_default_config if `config` is NULL.
  *
  * Must be called once per handle before any other j30d_* function is used
- * on it. Safe to call again later to fully re-init (e.g. after a suspected
- * bus fault) -- it re-copies `platform` and reapplies `config` from
- * scratch.
+ * on it. May be called again to re-initialise from scratch (e.g. after a
+ * suspected bus fault). It takes `platform`'s lock before touching `h`, so
+ * with the same platform it is serialized against other calls on the
+ * handle; if the lock cannot be acquired it returns J30D_ERR_TIMEOUT and
+ * leaves `h` as it was.
  *
  * `h` and `platform` must not be NULL; `platform->i2c_read`, `i2c_write`,
  * `delay_ms` and `return_to_iic` must all be set (J30D_ERR_PARAM otherwise).
  *
- * If `config` is non-NULL, its `command` and `sleep` fields must NOT be
- * J30D_FIELD_UNCHANGED (J30D_ERR_PARAM otherwise). Those two are RAM
- * registers that this function's own soft reset returns to their hardware
- * reset values, so "leave whatever is currently on the device" has nothing
- * left to preserve by the time it would apply -- and COMMAND in particular
- * drives every sleep decision this driver makes, so it must be a value the
- * caller actually chose. Pass config == NULL to take j30d_default_config
- * for everything. The five EEPROM-backed fields DO survive the reset, so
- * J30D_FIELD_UNCHANGED is honoured for them: those registers are read back
- * off the device to seed h->config, which therefore reflects what the
- * device really holds rather than the compiled-in defaults.
+ * The config is checked as it will be applied -- j30d_default_config when
+ * `config` is NULL, and j30d_default_config's value for any field marked
+ * J30D_FIELD_DEFAULT -- before anything is written (J30D_ERR_PARAM
+ * otherwise):
+ *   - `command` and `sleep` must not be J30D_FIELD_UNCHANGED. They are RAM
+ *     registers that the soft reset returns to their reset values, so there
+ *     is nothing left to preserve, and COMMAND drives every sleep decision
+ *     this driver makes.
+ *   - `interrupt_enable` requires platform.release_to_int, platform.now_ms
+ *     and SLEEP_EN in `command` -- see j30d_config.h.
+ * The other six fields may be J30D_FIELD_UNCHANGED: they are read back from
+ * the device after the reset, so h->config reflects what the device holds.
  */
 j30d_err_t j30d_init(j30d_handle_t *h, const j30d_platform_t *platform, const j30d_config_t *config);
 
 /*
- * Writes only the fields marked J30D_FIELD_UPDATED in `config` to the
- * device (RAM registers immediately, EEPROM registers per the device's
- * normal EEPROM write sequence), then merges the written values into
- * h->config. Fields left J30D_FIELD_UNCHANGED are left alone both on the
- * device and in h->config. Fields marked J30D_FIELD_DEFAULT are written
- * from j30d_default_config.
+ * Writes the fields marked J30D_FIELD_UPDATED (their own .value) or
+ * J30D_FIELD_DEFAULT (j30d_default_config's value) and merges them into
+ * h->config. Fields left J30D_FIELD_UNCHANGED are left alone on the device
+ * and in h->config, so a zero-initialised j30d_config_t with one field set
+ * changes that field only.
+ *
+ * `interrupt_enable` is ignored: interrupt mode is chosen at j30d_init().
+ * Clearing SLEEP_EN here pauses it -- an awake device raises no INT -- and
+ * setting SLEEP_EN again resumes it.
  *
  * Returns J30D_ERR_NOT_INIT if called before a successful j30d_init().
  */
@@ -143,40 +132,124 @@ j30d_err_t j30d_update_config(j30d_handle_t *h, const j30d_config_t *config);
  * several share one burst read (ch1/ch2 come from one 6-byte read, the
  * three raw fields from one 9-byte read) -- sharing a transaction is a
  * transport detail and never promotes a field to J30D_FRESH on the
- * strength of some other field's bit. In practice this means that in
- * single-conversion mode (J30D_COMMAND_MODE_SEL_SINGLE, the default) only
- * the converting channel is ever reported fresh and the other stays
- * J30D_STALE -- which is the honest answer: the device produced no sample
- * for it. If the DRDY bit is set but reading the value itself
- * fails, the field is marked J30D_ERROR and the value is likewise left
- * unchanged.
+ * strength of some other field's bit. In single-conversion mode
+ * (J30D_COMMAND_MODE_SEL_SINGLE, the default) only the converting channel
+ * is ever reported fresh; the other stays J30D_STALE because the device
+ * produced no sample for it. If the DRDY bit is set but reading the value
+ * fails, the field is marked J30D_ERROR and its value is left unchanged.
  *
- * The function's own return code reflects transport health only: J30D_OK
- * unless the wake failed to stop the conversion engine, or the initial
- * status-register read failed (in both cases nothing in `out` is touched),
- * or at least one field's read failed (J30D_ERR_I2C/TIMEOUT -- check
- * per-field .state in `out` to see which).
+ * The return code reflects transport health only: J30D_OK unless the wake
+ * failed to stop the conversion engine, or the initial status-register read
+ * failed (in both cases nothing in `out` is touched), or at least one
+ * field's read failed (J30D_ERR_I2C/TIMEOUT -- check per-field .state in
+ * `out` to see which).
  *
  * Returns J30D_ERR_NOT_INIT if called before a successful j30d_init().
- * Wakes the device and stops the conversion engine first (and re-commands
- * sleep afterward) if sleep is currently configured -- see the file header
- * note on sleep handling.
  *
- * Paced to the sleep interval if platform.now_ms is set -- or to half of it
- * in interrupt mode, where the pacing must also reject the INT the device
- * raises a few ms after every sleep command without rejecting a genuine one
- * from a part whose untrimmed sleep timer runs fast. If sleep is
- * configured and less time than that has passed
- * since this function last actually woke the device, it returns
- * immediately without touching the bus at all -- `out` is filled from the
- * same last known-good data as always, with every field's .state forced
- * to J30D_STALE (there was, by construction, no opportunity for anything
- * new). Call as often as you like from as many threads as you like; you
- * cannot make this function wake the device more often than its own
- * configured sleep interval. Without platform.now_ms, every call wakes
- * the device if sleep is configured, same as before -- see j30d_platform.h.
+ * Paced when sleep is configured and platform.now_ms is set. Every sleep
+ * command -- this function's own, and those of j30d_init(),
+ * j30d_update_config() and the raw calls -- restarts the device's
+ * conversion cycle, and a wake halts a conversion under way. So until the
+ * conversion ending the first sleep interval is certainly complete, on any
+ * part within the oscillator tolerance, this function returns at once
+ * without touching the bus, filling `out` from the last known-good data
+ * with every .state J30D_STALE. In interrupt mode an INT recorded by
+ * j30d_notify_interrupt() lets it read sooner, once past the INT the device
+ * raises on entry to sleep; with no INT pending the full polling wait
+ * applies.
+ *
+ * Without platform.now_ms every call on a sleeping device wakes it, and
+ * calls closer together than j30d_get_sample_interval_ms() can then return
+ * no new data at all: each one halts the conversion the last one started.
+ *
+ * Converting continuously (sleep off, MODE_EN set), the device can stop on
+ * its own: an I2C transfer that holds SCL low for about 10 ms clears its
+ * COMMAND register (see j30d_platform.h). So when a call finds no new data
+ * and none has arrived for longer than two conversions, it reads COMMAND
+ * back, and if conversions have stopped it writes COMMAND again and returns
+ * J30D_ERR_RESTARTED, with `out` filled as for any call with no new data.
+ * The next sample follows one conversion later. Without platform.now_ms it
+ * reads COMMAND on every call that finds no new data. J30D_ERR_RESTARTED
+ * means a transfer on your bus stalled; the fix belongs in the port.
  */
 j30d_err_t j30d_get_data(j30d_handle_t *h, j30d_data_t *out);
+
+/* Records an interrupt on the J30D's INT line. The only function here that
+ * may be called from interrupt context: it stores one flag, nothing else.
+ *
+ * Call it from your EXTI handler, then signal a task and call
+ * j30d_get_data() or j30d_get_data_blocking() from that task -- never from
+ * the handler, which would block for tens of milliseconds and, on an RTOS
+ * port, sleep.
+ *
+ * In interrupt mode a pending flag lets the next j30d_get_data() read
+ * before the full polling wait, provided the window after the last sleep
+ * command -- in which the device raises an INT for its conversion on entry
+ * to sleep -- has passed. Each j30d_get_data() clears the flag. So call it
+ * only for the J30D's INT, and answer every INT promptly: an INT left
+ * pending past that window is taken as the sample. Outside interrupt mode
+ * it has no effect. h may be NULL. */
+void j30d_notify_interrupt(j30d_handle_t *h);
+
+/*
+ * Waits for the next new sample and returns it. J30D_OK means raw_ch1 --
+ * the heat-flux input -- is J30D_FRESH; the other fields carry their own
+ * .state as with j30d_get_data().
+ *
+ * Every attempt goes through j30d_get_data() and its pacing, so with sleep
+ * configured each sample it returns comes from the conversion that ends a
+ * full sleep interval -- never from one taken while the device is awake.
+ * In polling it waits out the worst-case sample time (see
+ * j30d_get_sample_interval_ms()). In interrupt mode it returns as soon as
+ * the INT marking the sample has been recorded by j30d_notify_interrupt(),
+ * which on a nominal part is sooner; if no INT arrives it still returns
+ * after the worst-case time. Without sleep it returns the next conversion.
+ *
+ * Waits in platform.delay_ms() without holding the platform lock, so other
+ * calls on the handle can run meanwhile -- though one that re-commands
+ * sleep restarts the wait. Returns J30D_ERR_TIMEOUT if no new sample has
+ * arrived within timeout_ms, with `out` holding what the last attempt
+ * returned; transport errors and J30D_ERR_RESTARTED are returned as
+ * j30d_get_data() reports them.
+ * Requires platform.now_ms (J30D_ERR_PARAM otherwise). Never call it from
+ * interrupt context.
+ */
+j30d_err_t j30d_get_data_blocking(j30d_handle_t *h, j30d_data_t *out, uint32_t timeout_ms);
+
+/*
+ * Heat flux from a raw_ch1 sample, applying the unit's factory calibration
+ * (h->calib, read at j30d_init()):
+ *
+ *   REV1, REV2PLUS     HF = gain1 * raw_ch1 [mV] + offset1
+ *   CH1_NOTIMESTAMP    HF = gain1 * 1e-5 * raw_ch1 [raw code] - offset1
+ *
+ * j30d_heat_flux() gives HF in mW/cm2 as a float. j30d_heat_flux_x1000()
+ * gives the same quantity as an integer in mW/cm2 x 1000 -- 12345 means
+ * 12.345 mW/cm2 -- and is the one available in J30D_NO_FLOAT builds.
+ *
+ *   j30d_data_t d;
+ *   float       hf;
+ *   if (j30d_get_data_blocking(&h, &d, 5000) == J30D_OK &&
+ *       j30d_heat_flux(&h, &d.raw_ch1, &hf) == J30D_OK) { ... hf, mW/cm2 ... }
+ *
+ * Pure arithmetic: no bus access, no lock. It converts whatever the field
+ * holds, so check raw_ch1->state, or take the sample from
+ * j30d_get_data_blocking(), whose J30D_OK means it is fresh.
+ *
+ * Returns J30D_ERR_NO_CALIB for a unit whose calibration is missing or not
+ * trusted (calib.valid false, or version CH2 / UNKNOWN), and J30D_ERR_PARAM
+ * / J30D_ERR_NOT_INIT as usual.
+ *
+ * The CH1_NOTIMESTAMP form works on the raw code, so it holds only at the
+ * PGA gain the unit was calibrated at. In J30D_NO_FLOAT builds the mV form
+ * uses the ch1 gain in effect now, so convert a sample before changing
+ * ch1_cfg. The calibration assumes the default 1500 ms SLEEP_TIME -- see
+ * J30D_SLEEP_TIME_MS in j30d_config.h.
+ */
+#if !defined(J30D_NO_FLOAT)
+j30d_err_t j30d_heat_flux(const j30d_handle_t *h, const j30d_field_t *raw_ch1, float *mw_cm2);
+#endif
+j30d_err_t j30d_heat_flux_x1000(const j30d_handle_t *h, const j30d_field_t *raw_ch1, int32_t *mw_cm2_x1000);
 
 /*
  * Raw register pass-through -- bypasses the config/data model entirely.
@@ -192,8 +265,8 @@ j30d_err_t j30d_get_data(j30d_handle_t *h, j30d_data_t *out);
  * wake/re-sleep automatically like j30d_get_data().
  *
  * A successful j30d_raw_write() that lands on a register the config model
- * covers (COMMAND, SLEEP_TIME, SYS_CFG1/2, SYS_CH1/2_CFG, BIAS_CFG --
- * including as part of a multi-byte burst that spans one) updates
+ * covers (COMMAND, SLEEP_TIME, CHIP_ADDRESS, SYS_CFG1/2, SYS_CH1/2_CFG,
+ * BIAS_CFG -- including as part of a multi-byte burst that spans one) updates
  * h->config's shadow to match, before the automatic re-sleep step runs. So
  * writing COMMAND here does what it says: clear SLEEP_EN and the device is
  * left awake, set it and the device sleeps, and h->config agrees either
@@ -227,20 +300,6 @@ j30d_err_t j30d_get_data(j30d_handle_t *h, j30d_data_t *out);
  * They are build-time switches so that enabling one is a decision recorded
  * in the build, not something a stray call can reach.
  */
-/* Records an interrupt on the J30D's INT line. The only function here that
- * may be called from interrupt context: it stores one flag, nothing else.
- *
- * Call it from your EXTI handler, then signal a task and call
- * j30d_get_data() from that task -- never from the handler, which would
- * block for tens of milliseconds and, on an RTOS port, sleep.
- *
- * The flag is recorded only: it does not change what the next
- * j30d_get_data() does. The sleep-interval pacing applies to
- * interrupt-driven reads too, and is what rejects the extra interrupt the
- * device raises a few ms after every sleep command. Extra calls are
- * harmless, as is calling it with interrupt mode off. h may be NULL. */
-void j30d_notify_interrupt(j30d_handle_t *h);
-
 j30d_err_t j30d_raw_read(j30d_handle_t *h, uint8_t reg, uint8_t *buf, size_t len);
 j30d_err_t j30d_raw_write(j30d_handle_t *h, uint8_t reg, const uint8_t *buf, size_t len);
 
@@ -264,6 +323,28 @@ j30d_err_t j30d_raw_write(j30d_handle_t *h, uint8_t reg, const uint8_t *buf, siz
 const j30d_calib_t  *j30d_get_calib(const j30d_handle_t *h);
 const j30d_config_t *j30d_get_config(const j30d_handle_t *h);
 bool                 j30d_is_initialized(const j30d_handle_t *h);
+
+/*
+ * The polling period at which every j30d_get_data() call returns new data,
+ * on any part within the oscillator tolerance. Set a polling timer to at
+ * least this.
+ *
+ * With sleep configured, the sample period is not SLEEP_TIME. Each read ends
+ * in a sleep command, after which the device converts, sleeps for
+ * SLEEP_TIME and converts again, so a sample is ready that long after the
+ * read -- plus the read itself. Both are taken at their longest:
+ * SLEEP_TIME's oscillator is untrimmed (+/-15%). At the defaults (1.5 s,
+ * OSR 8192/512, 1.2 MHz) this comes to 1796 ms. Without sleep, it is one
+ * conversion at its longest.
+ *
+ * Calling more often is harmless with platform.now_ms set -- the extra
+ * calls return without touching the bus -- but gains nothing. In interrupt
+ * mode, read on the INT instead.
+ *
+ * Same standing as the accessors above: no bus access, no lock. 0 for a
+ * NULL handle or one that has not been through a successful j30d_init().
+ */
+uint32_t             j30d_get_sample_interval_ms(const j30d_handle_t *h);
 
 #ifdef __cplusplus
 }

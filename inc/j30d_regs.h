@@ -1,16 +1,20 @@
 /*
  * j30d_regs.h
  *
- * Device register map and bit definitions. Internal to the driver --
- * customers configure the sensor through j30d_config.h / j30d.h, not by
- * poking these addresses directly, so this header is not included by
- * j30d.h itself (only by j30d.c and j30d_config.c).
+ * Device register addresses, and the bits only the driver uses. Internal
+ * to the driver -- customers configure the sensor through j30d_config.h /
+ * j30d.h, not by poking these addresses directly, so this header is not
+ * included by j30d.h itself. The values that go in each config field
+ * (J30D_COMMAND_*, J30D_SYS_CFG1_*, J30D_SYS_CHx_CFG_*, ...) are public and
+ * live in j30d_config.h, which this header includes.
  */
 
 #ifndef J30D_REGS_H_
 #define J30D_REGS_H_
 
 #include <stdint.h>
+
+#include "j30d_config.h"   /* the field values */
 
 /* --- RAM --- */
 #define J30D_REG_SOFT_RESET          0x00
@@ -25,8 +29,8 @@
 #define J30D_TO1_DRDY_Msk            ((uint8_t)(1U << J30D_TO1_DRDY_Pos))
 #define J30D_TO2_DRDY_Pos            2U
 #define J30D_TO2_DRDY_Msk            ((uint8_t)(1U << J30D_TO2_DRDY_Pos))
-/* Bit 3 (OBJ_DRDY) intentionally not defined here -- this driver never
- * reads the OBJ register, see J30D_REG_OBJ_MSB's removal note below. */
+/* Bit 3 (OBJ_DRDY) is not defined: this driver never reads the OBJ
+ * register -- see the note on J30D_REG_OBJ_MSB below. */
 
 #define J30D_REG_DATA_READY_RAW      0x03
 #define J30D_TA_RAW_DRDY_Pos         4U
@@ -41,30 +45,15 @@
  * during j30d_init()'s soft-reset handshake. */
 #define J30D_ERROR_CODE_EEPROM_LOADED_Msk   ((uint8_t)(0x02))
 
-/* J30D_REG_OBJ_MSB (0x10) intentionally not defined here. The ASIC also
- * computes an on-chip "object temperature" from the IR reading under an
- * emissivity/distance assumption, but this driver targets heat-flux
- * measurement, where that conversion doesn't apply -- so the register,
- * its DRDY bit, and the corresponding data field are all left out rather
- * than carried along unused. */
+/* J30D_REG_OBJ_MSB (0x10) is not defined. The ASIC's on-chip "object
+ * temperature" converts the IR reading under an emissivity/distance
+ * assumption that does not apply to heat-flux measurement, so the
+ * register, its DRDY bit and a data field for it are all left out. */
 #define J30D_REG_AMB_MSB             0x16
 #define J30D_REG_CAL_MSB             0x19   /* ch1 cal, 6 bytes covers ch1+ch2 */
 #define J30D_REG_RAW_MSB             0x22   /* ch1/ch2/amb raw, 9 bytes */
 
 #define J30D_REG_COMMAND             0x30
-#define J30D_COMMAND_MODE_SEL_Pos    0U
-#define J30D_COMMAND_MODE_SEL_Msk    ((uint8_t)(3U << J30D_COMMAND_MODE_SEL_Pos))
-#define J30D_COMMAND_MODE_EN_Pos     3U
-#define J30D_COMMAND_MODE_EN         ((uint8_t)(1U << J30D_COMMAND_MODE_EN_Pos))
-#define J30D_COMMAND_SLEEP_EN_Pos    5U
-#define J30D_COMMAND_SLEEP_EN        ((uint8_t)(1U << J30D_COMMAND_SLEEP_EN_Pos))
-#define J30D_COMMAND_CLK_Pos         4U
-#define J30D_COMMAND_CLK_600KHZ      ((uint8_t)(0U << J30D_COMMAND_CLK_Pos))
-#define J30D_COMMAND_CLK_1200KHZ     ((uint8_t)(1U << J30D_COMMAND_CLK_Pos))
-#define J30D_COMMAND_MODE_SEL_SINGLE     ((uint8_t)(0U << J30D_COMMAND_MODE_SEL_Pos))
-#define J30D_COMMAND_MODE_SEL_DUAL       ((uint8_t)(2U << J30D_COMMAND_MODE_SEL_Pos))
-#define J30D_COMMAND_MODE_SEL_DUAL_FAST  ((uint8_t)(3U << J30D_COMMAND_MODE_SEL_Pos))
-
 #define J30D_REG_SLEEP_TIME          0x31   /* 0x00 = 100ms, then +100ms per step */
 #define J30D_REG_BLOW_START          0x40   /* blows EEPROM fuse -- production use only */
 
@@ -78,68 +67,10 @@
 #define J30D_REG_CHIP_ADDRESS        0x92
 
 #define J30D_REG_SYS_CFG1            0x93
-#define J30D_SYS_CFG1_OSRT_AMB_Pos   0U
-#define J30D_SYS_CFG1_OSR_AMB_Msk    ((uint8_t)(7U << J30D_SYS_CFG1_OSRT_AMB_Pos))
-#define J30D_SYS_CFG1_OUT_MODE_Pos   3U
-#define J30D_SYS_CFG1_OUT_MODE_Msk   ((uint8_t)(3U << J30D_SYS_CFG1_OUT_MODE_Pos))
-#define J30D_SYS_CFG1_FILT_COEF_Pos  5U
-#define J30D_SYS_CFG1_FILT_COEF_Msk  ((uint8_t)(7U << J30D_SYS_CFG1_FILT_COEF_Pos))
-#define J30D_SYS_CFG1_OSRT_512       ((uint8_t)(0U << J30D_SYS_CFG1_OSRT_AMB_Pos))
-#define J30D_SYS_CFG1_OSRT_1024      ((uint8_t)(1U << J30D_SYS_CFG1_OSRT_AMB_Pos))
-#define J30D_SYS_CFG1_OSRT_2048      ((uint8_t)(2U << J30D_SYS_CFG1_OSRT_AMB_Pos))
-#define J30D_SYS_CFG1_OSRT_4096      ((uint8_t)(3U << J30D_SYS_CFG1_OSRT_AMB_Pos))
-#define J30D_SYS_CFG1_OSRT_128       ((uint8_t)(4U << J30D_SYS_CFG1_OSRT_AMB_Pos))
-#define J30D_SYS_CFG1_OSRT_256       ((uint8_t)(5U << J30D_SYS_CFG1_OSRT_AMB_Pos))
-#define J30D_SYS_CFG1_OSRT_8192      ((uint8_t)(6U << J30D_SYS_CFG1_OSRT_AMB_Pos))   /* was misspelled _8196 */
-#define J30D_SYS_CFG1_OSRT_16384     ((uint8_t)(7U << J30D_SYS_CFG1_OSRT_AMB_Pos))
-#define J30D_SYS_CFG1_OUT_I2C        ((uint8_t)(0U << J30D_SYS_CFG1_OUT_MODE_Pos))
-#define J30D_SYS_CFG1_OUT_PWM        ((uint8_t)(1U << J30D_SYS_CFG1_OUT_MODE_Pos))
-#define J30D_SYS_CFG1_OUT_RELAY      ((uint8_t)(2U << J30D_SYS_CFG1_OUT_MODE_Pos))
-#define J30D_SYS_CFG1_FILT_DISABLE   ((uint8_t)(0U << J30D_SYS_CFG1_FILT_COEF_Pos))
-#define J30D_SYS_CFG1_FILT_1         ((uint8_t)(1U << J30D_SYS_CFG1_FILT_COEF_Pos))
-#define J30D_SYS_CFG1_FILT_2         ((uint8_t)(2U << J30D_SYS_CFG1_FILT_COEF_Pos))
-#define J30D_SYS_CFG1_FILT_3         ((uint8_t)(3U << J30D_SYS_CFG1_FILT_COEF_Pos))
-#define J30D_SYS_CFG1_FILT_4         ((uint8_t)(4U << J30D_SYS_CFG1_FILT_COEF_Pos))
-#define J30D_SYS_CFG1_FILT_5         ((uint8_t)(5U << J30D_SYS_CFG1_FILT_COEF_Pos))
-#define J30D_SYS_CFG1_FILT_6         ((uint8_t)(6U << J30D_SYS_CFG1_FILT_COEF_Pos))
-#define J30D_SYS_CFG1_FILT_7         ((uint8_t)(7U << J30D_SYS_CFG1_FILT_COEF_Pos))
-
-#define J30D_REG_SYS_CFG2               0x94
-#define J30D_SYS_CFG2_SWAP_Msk          ((uint8_t)(1U << 0))   /* input_swap: 1 = CH inputs bonded in reverse polarity */
-#define J30D_SYS_CFG2_VT_SCALE_Msk      ((uint8_t)(1U << 1))   /* 0 = +-16mV full range, 1 = +-128mV */
-#define J30D_SYS_CFG2_SLEEP_POL_Msk     ((uint8_t)(1U << 2))   /* SLEEP_OUT_Polarity: which side of the threshold triggers INT in Sleep mode -- not a sleep enable */
-#define J30D_SYS_CFG2_RELAY_POL_Msk     ((uint8_t)(1U << 3))   /* Relay_OUT_Polarity: which side of the threshold drives Relay output high -- not a relay enable */
-#define J30D_SYS_CFG2_PGA_PWR_Pos       4U           /* PGA_PWR<1:0>: power/noise trade-off, not a power-down bit */
-#define J30D_SYS_CFG2_PGA_PWR_Msk       ((uint8_t)(3U << J30D_SYS_CFG2_PGA_PWR_Pos))
-#define J30D_SYS_CFG2_SERIAL_FILT_Msk   ((uint8_t)(1U << 6))   /* SERIAL_filter_en: IIC input deglitch filter */
-#define J30D_SYS_CFG2_ADC_DITH_Msk      ((uint8_t)(1U << 7))
-
+#define J30D_REG_SYS_CFG2            0x94
 #define J30D_REG_SYS_CH1_CFG         0x95
 #define J30D_REG_SYS_CH2_CFG         0x96
-#define J30D_SYS_CHx_CFG_OSRP_Pos    0U
-#define J30D_SYS_CHx_CFG_OSRP_Msk    ((uint8_t)(7U << J30D_SYS_CHx_CFG_OSRP_Pos))
-#define J30D_SYS_CHx_CFG_GAIN_Pos    3U
-#define J30D_SYS_CHx_CFG_GAIN_Msk    ((uint8_t)(7U << J30D_SYS_CHx_CFG_GAIN_Pos))
-#define J30D_SYS_CHx_CFG_GAIN_8      ((uint8_t)(0U << J30D_SYS_CHx_CFG_GAIN_Pos))
-#define J30D_SYS_CHx_CFG_GAIN_12     ((uint8_t)(1U << J30D_SYS_CHx_CFG_GAIN_Pos))
-#define J30D_SYS_CHx_CFG_GAIN_16     ((uint8_t)(2U << J30D_SYS_CHx_CFG_GAIN_Pos))
-#define J30D_SYS_CHx_CFG_GAIN_32     ((uint8_t)(3U << J30D_SYS_CHx_CFG_GAIN_Pos))
-#define J30D_SYS_CHx_CFG_GAIN_48     ((uint8_t)(4U << J30D_SYS_CHx_CFG_GAIN_Pos))
-#define J30D_SYS_CHx_CFG_GAIN_64     ((uint8_t)(5U << J30D_SYS_CHx_CFG_GAIN_Pos))
-#define J30D_SYS_CHx_CFG_GAIN_96     ((uint8_t)(6U << J30D_SYS_CHx_CFG_GAIN_Pos))
-#define J30D_SYS_CHx_CFG_GAIN_128    ((uint8_t)(7U << J30D_SYS_CHx_CFG_GAIN_Pos))
-#define J30D_SYS_CHx_CFG_OSRP_512    ((uint8_t)(0U << J30D_SYS_CHx_CFG_OSRP_Pos))
-#define J30D_SYS_CHx_CFG_OSRP_1024   ((uint8_t)(1U << J30D_SYS_CHx_CFG_OSRP_Pos))
-#define J30D_SYS_CHx_CFG_OSRP_2048   ((uint8_t)(2U << J30D_SYS_CHx_CFG_OSRP_Pos))
-#define J30D_SYS_CHx_CFG_OSRP_4096   ((uint8_t)(3U << J30D_SYS_CHx_CFG_OSRP_Pos))
-#define J30D_SYS_CHx_CFG_OSRP_128    ((uint8_t)(4U << J30D_SYS_CHx_CFG_OSRP_Pos))
-#define J30D_SYS_CHx_CFG_OSRP_256    ((uint8_t)(5U << J30D_SYS_CHx_CFG_OSRP_Pos))
-#define J30D_SYS_CHx_CFG_OSRP_8192   ((uint8_t)(6U << J30D_SYS_CHx_CFG_OSRP_Pos))
-#define J30D_SYS_CHx_CFG_OSRP_16384  ((uint8_t)(7U << J30D_SYS_CHx_CFG_OSRP_Pos))
-
 #define J30D_REG_BIAS_CFG            0x97
-#define J30D_BIAS_CFG_DAC_Msk        ((uint8_t)(15U << 0))
-#define J30D_BIAS_CFG_5_16_AVDD      ((uint8_t)(0x0D))
 
 /* Sleep-mode INT threshold, 16 bits MSB first, two's complement.
  * LSB = 1mV * 2^-8, so 0x8000 is -128mV. Compared after every

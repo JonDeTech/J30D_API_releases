@@ -82,6 +82,12 @@ set(J30D_EEPROM_POLL_ATTEMPTS "" CACHE STRING
 set(J30D_EEPROM_POLL_DELAY_MS "" CACHE STRING
     "Override the delay between EEPROM-loaded polls in ms (driver default: 10)")
 
+# j30d_get_data() pacing. Empty means "leave the driver's own default".
+set(J30D_PACING_MARGIN_MS "" CACHE STRING
+    "Override the allowance for platform.now_ms resolution in ms (driver default: 10)")
+set(J30D_READ_OVERHEAD_MS "" CACHE STRING
+    "Override the allowance for one waking read in j30d_get_sample_interval_ms() (driver default: 40)")
+
 option(J30D_BUILD_TESTS "Build the host-side test suite" ${_j30d_standalone})
 option(J30D_WERROR "Treat compiler warnings as errors" OFF)
 option(J30D_INSTALL "Generate install and package-config rules" ${_j30d_standalone})
@@ -148,7 +154,9 @@ endforeach()
 # Timing overrides only affect j30d.c, so PRIVATE is enough.
 foreach(_tunable J30D_RESET_SETTLE_DELAY_MS
                  J30D_EEPROM_POLL_ATTEMPTS
-                 J30D_EEPROM_POLL_DELAY_MS)
+                 J30D_EEPROM_POLL_DELAY_MS
+                 J30D_PACING_MARGIN_MS
+                 J30D_READ_OVERHEAD_MS)
     if(NOT "${${_tunable}}" STREQUAL "")
         target_compile_definitions(j30d PRIVATE ${_tunable}=${${_tunable}}u)
     endif()

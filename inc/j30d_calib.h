@@ -7,10 +7,9 @@
  * wafer, silicon revision). j30d_init() reads and parses it once,
  * best-effort, into h->calib -- see j30d.h.
  *
- * This is read-only from the driver's side: nothing in j30d.c ever writes
- * this block (the legacy driver's write path, used only by factory/CJB
- * calibration tooling, is intentionally not part of this driver).
- *
+ * This is read-only from the driver's side: nothing in j30d.c writes this
+ * block, and j30d_raw_write() refuses to unless the build defines
+ * J30D_ALLOW_CALIBRATION_WRITE.
  */
 
 #ifndef J30D_CALIB_H_
@@ -24,7 +23,7 @@ extern "C" {
 #endif
 
 /* How much of the 48-byte calibration block j30d_init() was able to trust,
- * in the order the legacy driver added support for it.  */
+ * oldest unit generation first. */
 typedef enum
 {
 	J30D_UNIT_VERSION_UNKNOWN          = 0,   /* couldn't tell -- treat calib as absent */
@@ -49,9 +48,9 @@ typedef struct
 	uint16_t  lot_no;
 	uint16_t  wafer_no;
 
-	/* Offset/gain trim for the heat-flux conversion, one pair per channel.
-	 * Units and the formula they feed depend on `version` channel 2's is
-	 * carried here for completeness/future use. */
+	/* Offset/gain trim for the heat-flux conversion, one pair per channel;
+	 * j30d_heat_flux() applies channel 1's. The format depends on `version`,
+	 * as below. Channel 2's pair is carried for completeness. */
 #if defined(J30D_NO_FLOAT)
 	/* J30D_NO_FLOAT build (see j30d_types.h): the raw 16-bit trim words
 	 * straight out of the EEPROM block, undecoded, so the driver contains

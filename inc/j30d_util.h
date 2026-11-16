@@ -88,6 +88,14 @@ static inline uint16_t j30d_crc16(const uint8_t *data, uint16_t length)
 	return (uint16_t)swapped;
 }
 
+/* SYS_CHx_CFG's gain field to the PGA gain it selects. */
+static inline uint32_t pga_gain(uint8_t cfg_reg_value)
+{
+	static const uint8_t gain_table[8] = { 8u, 12u, 16u, 32u, 48u, 64u, 96u, 128u };
+	uint8_t idx = (uint8_t)((cfg_reg_value & J30D_SYS_CHx_CFG_GAIN_Msk) >> J30D_SYS_CHx_CFG_GAIN_Pos);
+	return gain_table[idx & 0x7u];
+}
+
 #if !defined(J30D_NO_FLOAT)
 
 /* U8Q8: 8-bit unsigned integer part + 8-bit fraction (range 0..255.996). */
@@ -102,12 +110,16 @@ static inline float j30d_s7q8_to_float(uint8_t msb, uint8_t lsb)
 	return (float)(int16_t)j30d_trim_word(msb, lsb) / 256.0f;
 }
 
-/* SYS_CHx_CFG's gain field to the gain it selects. */
+/* SYS_CHx_CFG's gain field to the gain it selects, as a float. */
 static inline float decode_gain(uint8_t cfg_reg_value)
 {
-	static const float gain_table[8] = { 8.0f, 12.0f, 16.0f, 32.0f, 48.0f, 64.0f, 96.0f, 128.0f };
-	uint8_t idx = (cfg_reg_value & J30D_SYS_CHx_CFG_GAIN_Msk) >> J30D_SYS_CHx_CFG_GAIN_Pos;
-	return gain_table[idx & 0x7u];
+	return (float)pga_gain(cfg_reg_value);
+}
+
+/* SYS_CFG2's VT_SCALE bit to the CAL registers' codes per millivolt. */
+static inline float vtp_scale(uint8_t sys_cfg2_value)
+{
+	return (sys_cfg2_value & J30D_SYS_CFG2_VT_SCALE_Msk) ? J30D_VTP_SCALE_WIDE : J30D_VTP_SCALE;
 }
 
 static inline float raw_to_mv(int32_t raw, float gain)

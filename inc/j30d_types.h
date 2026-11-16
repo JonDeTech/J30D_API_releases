@@ -29,6 +29,10 @@ typedef enum
 	J30D_ERR_TIMEOUT,             /* transport or handshake did not complete in time, or
 	                                * platform.lock reported it could not acquire the lock */
 	J30D_ERR_EEPROM_NOT_LOADED,   /* soft-reset handshake: EEPROM-loaded bit never set */
+	J30D_ERR_NO_CALIB,            /* the unit carries no usable factory calibration
+	                                * (j30d_calib_t.version CH2 or UNKNOWN, or .valid false) */
+	J30D_ERR_RESTARTED,           /* j30d_get_data(): the device had stopped converting and
+	                                * the driver restarted it -- see j30d_get_data() in j30d.h */
 } j30d_err_t;
 
 /* Define J30D_NO_FLOAT for the whole build (driver and application alike)
@@ -65,23 +69,20 @@ typedef struct
 	j30d_field_state_t  state;
 } j30d_field_t;
 
-/* j30d_get_data() always refreshes every field below in one call.
- * The device's DATA_READY/DATA_READY_RAW status
- * registers clear ALL of their bits on being read, not just the bits for
- * whatever you go on to actually fetch, so partial selection could
- * silently starve a field you weren't asking for this call. See
- * j30d_get_data()'s doc comment in j30d.h.
+/* j30d_get_data() refreshes every field below in one call -- see its doc
+ * comment in j30d.h.
  *
- * There is deliberately no `obj` field: the ASIC also has an on-chip
- * "object temperature" register (converting the IR reading to a
- * temperature under an emissivity/distance assumption), but this driver
- * is used for heat-flux measurement, where that conversion doesn't apply
- * -- so it's not exposed here. */
+ * There is no `obj` field: the ASIC's on-chip "object temperature" converts
+ * the IR reading under an emissivity/distance assumption that does not
+ * apply to heat-flux measurement. */
 typedef struct
 {
-	j30d_field_t ch1;
-	j30d_field_t ch2;
-	j30d_field_t amb;
+	j30d_field_t ch1;       /* .value = millivolts: the ASIC's corrected thermopile voltage
+	                          * (CAL registers), scaled by SYS_CFG2's VT_SCALE -- see
+	                          * J30D_VTP_SCALE below. The factory heat-flux calibration
+	                          * (j30d_calib.h) applies to raw_ch1, not to this. */
+	j30d_field_t ch2;       /* as ch1, for channel 2 */
+	j30d_field_t amb;       /* .value = degrees C, the ASIC's internal temperature sensor */
 	j30d_field_t raw_ch1;   /* .value = millivolts at the PGA input */
 	j30d_field_t raw_ch2;   /* .value = millivolts at the PGA input */
 	j30d_field_t raw_amb;   /* unscaled ADC code only -- .value == .raw_code.
@@ -90,9 +91,11 @@ typedef struct
 } j30d_data_t;
 
 /* Scale constants used to derive .value from .raw_code (amb uses
- * J30D_AMB_SCALE, ch1/ch2 use J30D_VTP_SCALE; raw_ch1/raw_ch2 are NOT a
- * plain division of these -- see raw_to_mv() in j30d.c, they also fold in
- * PGA gain and the ADC reference voltage. raw_amb is not scaled at all:
+ * J30D_AMB_SCALE; ch1/ch2 use J30D_VTP_SCALE while SYS_CFG2's VT_SCALE is
+ * clear, +-16 mV full scale, and J30D_VTP_SCALE_WIDE while it is set,
+ * +-128 mV; raw_ch1/raw_ch2 are NOT a plain division of these -- see
+ * raw_to_mv() in j30d_util.h, they also fold in PGA gain and the ADC
+ * reference voltage. raw_amb is not scaled at all:
  * the ambient sensor has no analog front end, so it has no gain and no mV
  * interpretation -- its .value is simply its .raw_code). Public so code
  * outside the driver (adapters, tooling) that needs the relationship
@@ -101,14 +104,16 @@ typedef struct
  * Every one of them is a power of two, which is what makes the round-trip
  * value == raw_code / scale exact. The _SHIFT forms below say the same
  * thing without involving the FPU, and are defined in every build. */
-#define J30D_AMB_SCALE_SHIFT       14
-#define J30D_VTP_SCALE_SHIFT       19
-#define J30D_RAW_ADC_SCALE_SHIFT   23
+#define J30D_AMB_SCALE_SHIFT        14
+#define J30D_VTP_SCALE_SHIFT        19   /* VT_SCALE clear: 2^23 codes over 16 mV */
+#define J30D_VTP_SCALE_WIDE_SHIFT   16   /* VT_SCALE set:   2^23 codes over 128 mV */
+#define J30D_RAW_ADC_SCALE_SHIFT    23
 
 #if !defined(J30D_NO_FLOAT)
-#define J30D_AMB_SCALE       16384.0f    /* 2^14 */
-#define J30D_VTP_SCALE       524288.0f   /* 2^19 */
-#define J30D_RAW_ADC_SCALE   8388608.0f  /* 2^23 */
+#define J30D_AMB_SCALE        16384.0f    /* 2^14 */
+#define J30D_VTP_SCALE        524288.0f   /* 2^19 */
+#define J30D_VTP_SCALE_WIDE   65536.0f    /* 2^16 */
+#define J30D_RAW_ADC_SCALE    8388608.0f  /* 2^23 */
 
 /* The ADC's reference, in volts. Pairs with J30D_RAW_ADC_SCALE above to turn
  * a raw code into millivolts: mV = 1000 * code * VREF / (gain * SCALE). */
